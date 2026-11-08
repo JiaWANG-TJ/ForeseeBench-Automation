@@ -12,7 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from apscheduler.schedulers.blocking import BlockingScheduler
+from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
 from .benchmark import accept_submission, finalize_benchmark, release_benchmark, stage_output, validate_stage_result
@@ -401,6 +401,62 @@ def parser() -> argparse.ArgumentParser:
     return cli
 
 
+def run_service(config: Record, *, bootstrap: bool = False) -> None:
+    """定时器只唤醒主线程；采集与发布在主线程内按预算推进。"""
+    import math
+    import os
+    import signal
+    import threading
+    from datetime import timedelta
+    from functools import partial
+
+    interval = float(config["scheduler"]["poll_seconds"])
+    if not math.isfinite(interval) or interval <= 0:
+        raise ValueError("scheduler_interval_invalid")
+    due, cancelled = threading.Event(), threading.Event()
+    runtime = dict(config, cancel_event=cancelled)
+    scheduler = BackgroundScheduler(timezone="UTC")
+    scheduler.add_job(
+        due.set,
+        IntervalTrigger(seconds=interval, start_date=datetime.now(UTC)),
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=60,
+    )
+
+    def stop(signum: int, frame: Any) -> None:
+        cancelled.set()
+        due.set()
+
+    previous = {kind: signal.signal(kind, stop) for kind in (signal.SIGTERM, signal.SIGINT)}
+    try:
+        scheduler.start()
+        due.set()
+        while not cancelled.is_set():
+            due.wait()
+            due.clear()
+            if cancelled.is_set():
+                break
+            if config["scheduler"]["publish"] and (bucket_id := os.environ.get("HF_BUCKET")):
+                from huggingface_hub import HfApi
+
+                from .cloud import StorageGuard
+
+                guard = StorageGuard(HfApi(), bucket_id)
+                repo_id = config["publication"]["repo_id"]
+                guard.include_dataset(repo_id)
+                runtime["storage"] = dict(
+                    config["storage"], before_publish=partial(guard.before_publish, repo_id)
+                )
+            tick(runtime, bootstrap=bootstrap, stop_at=datetime.now(UTC) + timedelta(seconds=interval))
+    finally:
+        cancelled.set()
+        if scheduler.running:
+            scheduler.shutdown(wait=True)
+        for kind, handler in previous.items():
+            signal.signal(kind, handler)
+
+
 def main() -> None:
     args = parser().parse_args()
     if args.command == "download-view":
@@ -414,21 +470,10 @@ def main() -> None:
     if args.command in {"run", "tick"}:
         if args.qualification:
             raise SystemExit("定时服务仅运行正式管线")
-        tick(config)
         if args.command == "run":
-            scheduler = BlockingScheduler(timezone="UTC")
-            scheduler.add_job(
-                tick,
-                IntervalTrigger(
-                    seconds=config["scheduler"]["poll_seconds"],
-                    start_date=datetime(2020, 1, 1, tzinfo=UTC),
-                ),
-                args=[config],
-                max_instances=1,
-                coalesce=True,
-                misfire_grace_time=60,
-            )
-            scheduler.start()
+            run_service(config, bootstrap=args.bootstrap)
+        else:
+            tick(config, bootstrap=args.bootstrap)
         return
     try:
         if args.command == "submit":

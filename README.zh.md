@@ -18,6 +18,8 @@ LLM构题、题目审核、构造题GT和答案判分仍是后续处理器。当
 
 ## 自动化为什么能运行
 
+当前暂时运行在用户已有计算资源上，GitHub分配runner仍受账户billing lock阻塞。两种部署复用同一采集代码；本机运行期间关闭GitHub生产开关。实际状态见[验收记录](docs/acceptance.md)。
+
 ```text
 GitHub托管CPU任务 -> Polymarket API
                  -> HF私有Bucket：可恢复工作状态
@@ -41,6 +43,21 @@ GitHub定时触发可能延迟或漏跑，程序依据批次状态及真实UTC�
 | HF Dataset与私有Bucket | 长期保存快照及可恢复状态。HF公布的免费私有存储为100GB；程序在可见用量加预留写入达到90GB前暂停。这是保守保护阈值，不是平台计费读数。 |
 
 依据：[GitHub存储计费](https://docs.github.com/en/billing/concepts/product-billing/github-actions)、[runner规格](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)及[HF存储额度](https://huggingface.co/docs/hub/storage-limits)。容量估算必须包含原始响应、Parquet、JSONL、版本快照与工作状态；每周下载1GB不代表全部存储只增加1GB。两代检查点策略只删除不再被引用的临时对象，被引用的历史数据继续保留。
+
+### 在已有主机运行
+
+项目目录须持久保存，网络可访问PM，并具备HF认证。设置`HF_BUCKET`启用容量保护；主机环境配置可放在不进入Git的`data/service/environment.sh`，凭据继续存放在宿主认证缓存。
+
+```bash
+bash scripts/service.sh start
+bash scripts/service.sh status
+bash scripts/service.sh logs
+bash scripts/service.sh stop
+```
+
+`start`安装锁定依赖并检查连接及容量。Supervisor在工作进程退出后重启它，文件锁阻止另一台资源同时运行同一目录。主线程按预算推进任务，事务和来源游标跨轮次保留；本地文件存入`data/`，完成的快照发布HF，日志自动轮转。
+
+资源回收后，恢复网络并再次运行`start`。也可在Inspire的`notebook start`命令追加`--post-start 'bash /absolute/path/to/ForeseeBench/scripts/service.sh start'`，让平台启动完成后执行该命令。仅在网页点击启动不会执行它。离线期间可能错过截止，相关批次会明确保留为未完成或失效。每周创建一批还需要后续轮询GT，因此每周只执行一次脚本不足以完成流程。
 
 ## 每周时间安排
 

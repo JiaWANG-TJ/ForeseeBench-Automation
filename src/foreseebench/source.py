@@ -363,6 +363,23 @@ class Polymarket:
         if self.work_expired:
             raise WorkYield("runner_work_budget")
 
+    def _wait(self, seconds: float, deadline: datetime | None = None) -> None:
+        """限速和重试等待服从任务截止，并可被停止信号唤醒。"""
+        self.require_budget()
+        now = self.clock()
+        if deadline is not None and now >= deadline:
+            raise TimeoutError("freeze_deadline")
+        for cutoff in (self.stop_at, deadline):
+            if cutoff is not None:
+                seconds = min(seconds, max(0.0, (cutoff - now).total_seconds()))
+        if self.cancel_event is None:
+            time.sleep(seconds)
+        else:
+            self.cancel_event.wait(seconds)
+        self.require_budget()
+        if deadline is not None and self.clock() >= deadline:
+            raise TimeoutError("freeze_deadline")
+
     def __enter__(self) -> Polymarket:
         return self
 
@@ -417,7 +434,7 @@ class Polymarket:
             with self.rate_lock:
                 delay = 1 / self.rate - (time.monotonic() - self.last_request)
                 if delay > 0:
-                    time.sleep(delay)
+                    self._wait(delay, deadline)
                 self.last_request = time.monotonic()
             requested = self.clock()
             self.require_budget()
@@ -448,7 +465,7 @@ class Polymarket:
                         self.archive.append(spool, receipt)
                         if response.status_code in {429, 500, 502, 503, 504} and attempt + 1 < self.attempts:
                             retry = response.headers.get("Retry-After", "")
-                            time.sleep(float(retry) if retry.isdecimal() else min(60, 2**attempt))
+                            self._wait(float(retry) if retry.isdecimal() else min(60, 2**attempt), deadline)
                             continue
                         response.extensions["foreseebench_receipt"] = receipt
                         response.raise_for_status()
@@ -477,7 +494,7 @@ class Polymarket:
                 self._retire_client(client)
                 if attempt + 1 == self.attempts:
                     raise
-                time.sleep(min(60, 2**attempt))
+                self._wait(min(60, 2**attempt), deadline)
         raise RuntimeError("request_attempts_exhausted")
 
     def discovery_status(self) -> Record:

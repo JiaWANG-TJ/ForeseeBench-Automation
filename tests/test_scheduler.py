@@ -5,6 +5,59 @@ from foreseebench.contract import Week
 from foreseebench.store import Store
 
 
+def test_bootstrap_tick_command_resumes_the_same_batch_after_a_network_failure(tmp_path, monkeypatch):
+    import sys
+
+    import httpx
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 11, 8, 18, tzinfo=UTC)
+
+    attempts = []
+
+    def source(request):
+        ids = request.url.params.get_list("id")
+        if ids:
+            attempts.append(ids)
+            if len(attempts) == 1:
+                raise httpx.ReadTimeout("interrupted", request=request)
+        return httpx.Response(200, json={"events": [{"id": "1"}]})
+
+    config = {
+        "storage": {"root": tmp_path},
+        "scheduler": {"publish": False, "poll_seconds": 300},
+        "publication": {},
+        "config_hash": "config",
+        "network": {
+            "gamma_url": "https://source.invalid",
+            "data_url": "https://source.invalid",
+            "timeout_seconds": 1,
+            "attempts": 1,
+            "requests_per_second": 1e9,
+            "workers": 1,
+            "transport_factory": lambda: httpx.MockTransport(source),
+        },
+    }
+    monkeypatch.setattr(cli, "datetime", Clock)
+    monkeypatch.setattr(cli, "settings", lambda *args: config)
+    monkeypatch.setattr(sys, "argv", ["foreseebench", "--bootstrap", "tick"])
+    cli.main()
+    with Store(tmp_path) as store:
+        first = store.status()
+        assert len(first) == 1
+        assert not first[0]["frozen"]
+        batch_id = first[0]["id"]
+    cli.main()
+    with Store(tmp_path) as store:
+        resumed = store.status()
+        assert len(resumed) == 1 and resumed[0]["id"] == batch_id
+        assert resumed[0]["frozen"]
+        assert store.failures(batch_id)
+    assert attempts == [["1"], ["1"]]
+
+
 def test_incomplete_old_batch_cannot_block_later_weeks(tmp_path, monkeypatch):
     class Clock(datetime):
         @classmethod

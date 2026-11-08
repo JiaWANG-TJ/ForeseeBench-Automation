@@ -85,7 +85,13 @@ tags缺失/null保留为domain=null，真实空标签列表才是[]；非筛选�
 
 ## 存储与接口
 
-单进程通过文件锁持有DuckDB写入权，消费端读取不可变Parquet。生产由公开GitHub仓库的标准Ubuntu runner执行，使用单一并发组；数据库只在runner本地盘运行，不直接放在对象存储挂载上。
+单进程通过文件锁持有DuckDB写入权，消费端读取不可变Parquet。公开GitHub标准runner部署使用单一并发组，数据库在runner本地盘执行，不直接放在对象存储挂载上。
+
+2026-11-08用户另行授权在现有资源上临时运行，等待免费的云端执行恢复。该部署复用同一`tick`和`--bootstrap run`入口；Supervisor负责进程恢复，APScheduler只通知主线程执行，每轮工作预算等于`poll_seconds`，默认300秒。长扫描让出执行权后，下轮先检查已有GT任务，再继续已保存的范围；SIGTERM/SIGINT取消当前请求链并关闭数据库。整段服务通过共享文件锁防止两台资源同时启动同一数据目录。GitHub生产开关在本机运行期间保持关闭。
+
+本机数据位于项目共享文件系统的`data/`，数据库事务、原始响应和范围检查点在资源回收后仍可恢复；已完成快照按既有规则发布HF，服务日志只保留有限轮转文件。HF认证存放在用户共享认证缓存，凭据不进入Git、数据快照或发布清单。设置`HF_BUCKET`后，本机发布复用云端90GB容量检查。启动前检查PM连接与HF可见容量；服务启动命令是`bash scripts/service.sh start`，资源重启后执行同一命令，或由平台启动后的命令钩子执行。监督进程不能在资源离线期间运行；错过冻结或GT截止时按已有失效规则记录，不能补造停机期间的观测。
+
+迁回云端时先停止本机写入者，再把关闭后的完整本地状态保存为已验证Bucket检查点，从新runner核验恢复后才开启云端生产，不能让两种部署同时写入。该迁移尚未执行。
 网络采用8个有界worker并共享每秒5次限速；DuckDB使用独立读取cursor和串行事务锁，SQLite归档也串行提交。全域来源与候选任务均有界流式处理；限速等待后再次检查截止，禁止等待跨截止后仍发请求。准入统一执行提交截止的开边界和五天结束窗口的闭边界。
 HTTPX客户端按worker隔离；网络错误后先保留错误回执，再回收该worker的客户端并重试，避免代理TLS失败耗尽连接池。其他worker的连接不受回收影响。该路径已用本地CONNECT/TLS失败复现及回归核验，参见[httpcore上游问题](https://github.com/encode/httpcore/discussions/921)。
 四类 Parquet 为 events、comments、trades、resolutions；Market 结构内嵌在 events，评论和成交只按 Event 保存一次。

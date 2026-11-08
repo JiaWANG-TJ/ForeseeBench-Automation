@@ -18,6 +18,8 @@ LLM question construction, question review, constructed-question GT, and answer 
 
 ## How automation runs
 
+The current deployment temporarily runs on the owner's existing compute resource while GitHub runner allocation is blocked by an account billing lock. The same collection code supports both deployments; the GitHub production switch stays off during local operation. See the measured status in [acceptance](docs/acceptance.md).
+
 ```text
 GitHub-hosted CPU runner -> Polymarket APIs
                         -> private HF Bucket: resumable working state
@@ -41,6 +43,21 @@ The storage allowances apply to different resources:
 | HF Dataset and private Bucket | Persistent snapshots and resumable state. HF lists 100 GB of private storage for free accounts. The application pauses before its visible usage plus reserved writes reaches 90 GB; this is a conservative guard, not the platform's billing meter. |
 
 Sources: [GitHub storage billing](https://docs.github.com/en/billing/concepts/product-billing/github-actions), [runner specifications](https://docs.github.com/en/actions/reference/runners/github-hosted-runners), and [HF storage plans](https://huggingface.co/docs/hub/storage-limits). Capacity planning must include raw responses, Parquet, JSONL, versioned snapshots, and working state. A 1 GB weekly download does not establish 1 GB of total weekly storage growth. The two-generation checkpoint policy removes unreferenced temporary objects; it preserves referenced historical data.
+
+### Running on an existing host
+
+Use a persistent project directory, working network access, and HF authentication. Configure `HF_BUCKET` for the storage guard. Host-specific environment settings may be placed in the ignored `data/service/environment.sh`; keep credentials in the host's authentication cache.
+
+```bash
+bash scripts/service.sh start
+bash scripts/service.sh status
+bash scripts/service.sh logs
+bash scripts/service.sh stop
+```
+
+`start` installs locked dependencies and runs connection/storage preflight checks. Supervisor restarts a failed worker, and a file lock prevents a second host from running the same directory concurrently. The main thread advances work in bounded intervals, preserving transactions and source cursors between runs. Local files remain in `data/`; completed snapshots are published to HF. Logs rotate automatically.
+
+After the resource is recycled, restore network access and run `start` again. Inspire's `notebook start --post-start 'bash /absolute/path/to/ForeseeBench/scripts/service.sh start'` can attach this command to a platform restart. Restarting through the web UI alone does not execute it. Offline time can cause missed deadlines; such batches remain explicitly incomplete or invalid. A weekly batch also needs later GT polling, so running the script only once per week is insufficient.
 
 ## Weekly timing
 

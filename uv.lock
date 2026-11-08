@@ -198,6 +198,7 @@ dependencies = [
     { name = "numpy" },
     { name = "pyarrow" },
     { name = "simplejson" },
+    { name = "supervisor" },
 ]
 
 [package.dev-dependencies]
@@ -221,6 +222,7 @@ requires-dist = [
     { name = "numpy", specifier = "==2.3.4" },
     { name = "pyarrow", specifier = "==26.0.1" },
     { name = "simplejson", specifier = "==3.20.2" },
+    { name = "supervisor", specifier = "==4.3.0" },
 ]
 
 [package.metadata.requires-dev]
@@ -779,6 +781,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/f0/46/5c67324addd40fa2966f6e886cacbbe0407c03a500db94fb8bb40333fcdf/simplejson-3.20.2-cp312-cp312-win32.whl", hash = "sha256:8d7be7c99939cc58e7c5bcf6bb52a842a58e6c65e1e9cdd2a94b697b24cddb54", size = 74285, upload-time = "2025-09-26T16:28:15.931Z" },
     { url = "https://files.pythonhosted.org/packages/fa/c9/5cc2189f4acd3a6e30ffa9775bf09b354302dbebab713ca914d7134d0f29/simplejson-3.20.2-cp312-cp312-win_amd64.whl", hash = "sha256:2c0b4a67e75b945489052af6590e7dca0ed473ead5d0f3aad61fa584afe814ab", size = 75969, upload-time = "2025-09-26T16:28:17.017Z" },
     { url = "https://files.pythonhosted.org/packages/05/5b/83e1ff87eb60ca706972f7e02e15c0b33396e7bdbd080069a5d1b53cf0d8/simplejson-3.20.2-py3-none-any.whl", hash = "sha256:3b6bb7fb96efd673eac2e4235200bfffdc2353ad12c54117e1e4e2fc485ac017", size = 57309, upload-time = "2025-09-26T16:29:35.312Z" },
+]
+
+[[package]]
+name = "supervisor"
+version = "4.3.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/a9/b5/37e7a3706de436a8a2d75334711dad1afb4ddffab09f25e31d89e467542f/supervisor-4.3.0.tar.gz", hash = "sha256:4a2bf149adf42997e1bb44b70c43b613275ec9852c3edacca86a9166b27e945e", size = 468912, upload-time = "2025-08-23T18:25:02.418Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/0e/65/5e726c372da8a5e35022a94388b12252710aad0c2351699c3d76ae8dba78/supervisor-4.3.0-py2.py3-none-any.whl", hash = "sha256:0bcb763fddafba410f35cbde226aa7f8514b9fb82eb05a0c85f6588d1c13f8db", size = 320736, upload-time = "2025-08-23T18:25:00.767Z" },
 ]
 
 [[package]]
