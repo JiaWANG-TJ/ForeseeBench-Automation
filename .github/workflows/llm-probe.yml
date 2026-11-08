@@ -28,10 +28,18 @@ jobs:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
           LLM_MODEL: DeepSeek-V4.1-Flash-1017
         run: uv run --no-sync python -m foreseebench.llm --output llm-probe.json
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      - name: Write the probe summary
         if: always()
-        with:
-          name: llm-interface-probe
-          path: llm-probe.json
-          if-no-files-found: ignore
-          retention-days: 7
+        run: |
+          if [[ -f llm-probe.json ]]; then
+            python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          from pathlib import Path
+          report = json.loads(Path('llm-probe.json').read_text())
+          summary = {'model': report['model'], 'passed': report['passed'],
+                     'cases': [{'name': row['name'], 'seconds': row['seconds'],
+                                'content': row['response']['content']}
+                               for row in report['cases']]}
+          print('```json\n' + json.dumps(summary, ensure_ascii=False, indent=2) + '\n```')
+          PY
+          fi

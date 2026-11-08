@@ -15,7 +15,7 @@
 
 公开运行仓库：[JiaWANG-TJ/ForeseeBench-Automation](https://github.com/JiaWANG-TJ/ForeseeBench-Automation)。完整源码、分片发布、检查点恢复、免费预算门禁及工作流已配置；生产开关`FORESEEBENCH_ENABLED=false`。
 
-[资格运行42478848223](https://github.com/JiaWANG-TJ/ForeseeBench-Automation/actions/runs/42478848223)没有分配runner，执行步骤为0。GitHub注释明确为账户因billing issue被锁定。该结果不构成任何云端PM采集、Bucket恢复或Dataset发布资格通过。
+[资格运行42478848223](https://github.com/JiaWANG-TJ/ForeseeBench-Automation/actions/runs/42478848223)没有分配runner，执行步骤为0。GitHub注释明确为账户因billing issue被锁定。该结果不构成任何云端PM采集、Bucket恢复或Dataset发布资格通过。 最终代码的[再次运行42487612909](https://github.com/JiaWANG-TJ/ForeseeBench-Automation/actions/runs/42487612909)也在分配runner前因同一账户限制失败，未执行任何步骤。
 
 私有Bucket`SII-JiaWANG/ForeseeBench-state`已创建。控制端对真实HF用量接口的只读预检通过；这不能替代GitHub上的状态保存与冷启动恢复。账户恢复后须用最终代码重新启动资格验证，并重跑同一执行验证恢复，再启用生产。
 
