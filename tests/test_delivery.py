@@ -496,6 +496,240 @@ def fake_dataset_hub(root, monkeypatch):
     return hub
 
 
+@pytest.mark.parametrize("reason", ["deadline", "cancel"])
+def test_publication_deadline_interrupts_an_inflight_network_call(tmp_path, monkeypatch, reason):
+    import threading
+    import time
+    from datetime import UTC, datetime, timedelta
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    import httpx
+
+    import foreseebench.delivery as module
+    from foreseebench.source import WorkYield
+    from foreseebench.store import Store
+
+    release, received = threading.Event(), threading.Event()
+    cancel = threading.Event()
+    cancellation = threading.Timer(0.1, cancel.set)
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            received.set()
+            release.wait(3)
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    root = tmp_path / "local"
+    hub = fake_dataset_hub(tmp_path / "hub", monkeypatch)
+    freeze_event_slug_snapshot(root, "deadline")
+    original = hub.repo_info
+    with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+        thread = threading.Thread(target=server.serve_forever)
+        thread.start()
+        try:
+            with httpx.Client(trust_env=False) as client, Store(root) as store:
+
+                def blocked(*args, **kwargs):
+                    client.get(f"http://127.0.0.1:{server.server_port}", timeout=5)
+                    return original(*args, **kwargs)
+
+                monkeypatch.setattr(hub, "repo_info", blocked)
+                started = time.monotonic()
+                if reason == "cancel":
+                    cancellation.start()
+                with pytest.raises(WorkYield, match="runner_work_budget"):
+                    module.publish(
+                        store,
+                        root / "batches/2026-11-02/V1/manifest.json",
+                        "fixture/repo",
+                        "qualification",
+                        stop_at=datetime.now(UTC) + timedelta(seconds=0.25) if reason == "deadline" else None,
+                        cancel_event=cancel,
+                    )
+                elapsed = time.monotonic() - started
+            assert received.is_set()
+            assert elapsed < 1.5
+            assert hub.preuploads == [] and hub.commits == []
+        finally:
+            cancellation.cancel()
+            release.set()
+            server.shutdown()
+            thread.join()
+
+
+@pytest.mark.parametrize("boundary", ["preupload", "commit", "retry"])
+def test_publication_checks_deadline_between_external_operations(tmp_path, monkeypatch, boundary):
+    from datetime import timedelta
+
+    import httpx
+
+    import foreseebench.delivery as module
+    from foreseebench.contract import instant
+    from foreseebench.source import WorkYield
+    from foreseebench.store import Store
+
+    root = tmp_path / "local"
+    hub = fake_dataset_hub(tmp_path / "hub", monkeypatch)
+    freeze_event_slug_snapshot(root, "deadline")
+    now = instant("2026-11-08T12:00:00Z")
+    current = {"now": now}
+    attribute = {"preupload": "preupload_lfs_files", "commit": "create_commit", "retry": "repo_info"}[boundary]
+    original = getattr(hub, attribute)
+    calls = []
+
+    def slow(*args, **kwargs):
+        calls.append(boundary)
+        current["now"] = now + timedelta(seconds=11)
+        if boundary == "retry":
+            raise httpx.ReadError("upstream_disconnected_at_deadline")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(hub, attribute, slow)
+    with Store(root) as store, pytest.raises(WorkYield, match="runner_work_budget"):
+        module.publish(
+            store,
+            root / "batches/2026-11-02/V1/manifest.json",
+            "fixture/repo",
+            "qualification",
+            stop_at=now + timedelta(seconds=10),
+            clock=lambda: current["now"],
+        )
+    assert calls == [boundary]
+    assert len(hub.commits) == (1 if boundary == "commit" else 0)
+    assert hub.downloads == []
+    assert not (root / "batches/2026-11-02/V1/publication.json").exists()
+
+
+@pytest.mark.parametrize("earlier", ["work", "checkpoint"])
+def test_publication_preserves_the_earlier_alarm_and_restores_its_handler(tmp_path, monkeypatch, earlier):
+    import signal
+    import time
+    from datetime import UTC, datetime, timedelta
+
+    import foreseebench.delivery as module
+    from foreseebench.cloud import CheckpointDeadline
+    from foreseebench.source import WorkYield
+    from foreseebench.store import Store
+
+    root = tmp_path / "local"
+    hub = fake_dataset_hub(tmp_path / "hub", monkeypatch)
+    freeze_event_slug_snapshot(root, "deadline")
+
+    def blocked(*args, **kwargs):
+        time.sleep(3)
+        raise AssertionError("network_deadline_was_not_enforced")
+
+    def hard_deadline(signum, frame):
+        raise CheckpointDeadline("checkpoint_grace_exhausted")
+
+    monkeypatch.setattr(hub, "repo_info", blocked)
+    prior_handler = signal.getsignal(signal.SIGALRM)
+    prior_timer = signal.getitimer(signal.ITIMER_REAL)
+    try:
+        with Store(root) as store:
+            signal.signal(signal.SIGALRM, hard_deadline)
+            signal.setitimer(signal.ITIMER_REAL, 0.1 if earlier == "checkpoint" else 2)
+            exception = CheckpointDeadline if earlier == "checkpoint" else WorkYield
+            with pytest.raises(exception):
+                module.publish(
+                    store,
+                    root / "batches/2026-11-02/V1/manifest.json",
+                    "fixture/repo",
+                    "qualification",
+                    stop_at=datetime.now(UTC) + timedelta(seconds=2 if earlier == "checkpoint" else 0.1),
+                )
+            assert signal.getsignal(signal.SIGALRM) is hard_deadline
+            remaining, interval = signal.getitimer(signal.ITIMER_REAL)
+            assert interval == 0
+            assert (0 < remaining < 2) if earlier == "work" else remaining == 0
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, prior_handler)
+        signal.setitimer(signal.ITIMER_REAL, *prior_timer)
+
+
+def test_bounded_publication_refuses_a_worker_thread_before_any_external_operation(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from datetime import UTC, datetime, timedelta
+
+    import foreseebench.delivery as module
+    from foreseebench.store import Store
+
+    root = tmp_path / "local"
+    hub = fake_dataset_hub(tmp_path / "hub", monkeypatch)
+    freeze_event_slug_snapshot(root, "deadline")
+
+    def attempt():
+        with Store(root) as store:
+            module.publish(
+                store,
+                root / "batches/2026-11-02/V1/manifest.json",
+                "fixture/repo",
+                "qualification",
+                stop_at=datetime.now(UTC) + timedelta(seconds=10),
+            )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        with pytest.raises(RuntimeError, match="bounded_publication_requires_main_thread"):
+            executor.submit(attempt).result(timeout=5)
+    assert hub.downloads == [] and hub.preuploads == [] and hub.commits == []
+
+
+def test_publish_rerenders_unchanged_inputs_after_the_exporter_implementation_changes(tmp_path, monkeypatch):
+    import foreseebench.delivery as module
+    from foreseebench.store import Store, read_manifest
+
+    root, remote = tmp_path / "local", tmp_path / "hub"
+    hub = fake_dataset_hub(remote, monkeypatch)
+    freeze_event_slug_snapshot(root, "fixed")
+    path = root / "batches/2026-11-02/V1/manifest.json"
+    exporter = module.export_jsonl
+
+    class OldExporterOutput:
+        def __init__(self, output):
+            self.output = output
+
+        def write(self, value):
+            return self.output.write(value.replace('"slug":"fixed"', '"slug":"wrong"'))
+
+        def tell(self):
+            return self.output.tell()
+
+    def old_exporter(root, manifest, output, **kwargs):
+        exporter(root, manifest, OldExporterOutput(output), **kwargs)
+
+    rendered = []
+
+    def corrected_exporter(root, manifest, output, **kwargs):
+        rendered.append(manifest["batch_id"])
+        exporter(root, manifest, output, **kwargs)
+
+    monkeypatch.setattr(module, "export_jsonl", old_exporter)
+    monkeypatch.setattr(module, "implementation_provenance", lambda: {"implementation_hash": "old-exporter"})
+    with Store(root) as store:
+        module.publish(store, path, "fixture/repo", "qualification")
+        first = read_manifest(remote / hub.head / "manifest.json")
+        for entry in first["exports"]:
+            assert json.loads((remote / hub.head / entry["path"]).read_text())["slug"] == "wrong"
+        monkeypatch.setattr(module, "export_jsonl", corrected_exporter)
+        monkeypatch.setattr(module, "implementation_provenance", lambda: {"implementation_hash": "fixed-exporter"})
+        receipt = module.publish(store, path, "fixture/repo", "qualification")
+    assert rendered
+    current = read_manifest(remote / receipt["revision"] / "manifest.json")
+    assert current["export_implementation_hash"] == "fixed-exporter"
+    assert (
+        current["batches"]["2026-11-02"]["input_manifest_sha256"]
+        == first["batches"]["2026-11-02"]["input_manifest_sha256"]
+    )
+    for entry in current["exports"]:
+        assert json.loads((remote / hub.head / entry["path"]).read_text())["slug"] == "fixed"
+        assert receipt["verified_artifacts"][entry["path"]] == entry["sha256"]
+
+
 def test_publication_guard_receives_every_operation_before_any_upload(tmp_path, monkeypatch):
     import foreseebench.delivery as module
     from foreseebench.store import Store

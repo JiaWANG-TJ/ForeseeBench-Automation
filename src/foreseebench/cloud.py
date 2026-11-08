@@ -385,7 +385,9 @@ def run_once(
     clock: Callable[[], datetime] = lambda: datetime.now(UTC),
 ) -> Record:
     """一次恢复、按真实截止推进、关闭所有数据库，然后提交完整检查点。"""
-    from .cli import tick
+    from .cli import latest_path, tick
+    from .delivery import publish
+    from .source import WorkYield
 
     if not 1 <= work_seconds <= 2700:
         raise ValueError("runner_work_seconds_out_of_range")
@@ -399,13 +401,14 @@ def run_once(
         immutable_verifier=checkpoint.verify_immutable,
         file_resolver=lambda relative: checkpoint.resolve_file(root, relative),
     )
-    if qualification:
-        runtime["scheduler"] = dict(config["scheduler"], publish=False)
+    publish_enabled = config["scheduler"]["publish"] and not qualification
+    # 外部提交前必须先耐久保存冻结输入；进程失联不能重新生成 V1。
+    runtime["scheduler"] = dict(config["scheduler"], publish=False)
     guard = StorageGuard(checkpoint.api, checkpoint.bucket_id, limit_bytes=checkpoint.storage_guard.limit_bytes)
     checkpoint.storage_guard = guard
     cancel_event = config.get("cancel_event") or threading.Event()
     runtime["cancel_event"] = cancel_event
-    if runtime["scheduler"]["publish"]:
+    if publish_enabled:
         repo_id = config["publication"]["repo_id"]
         guard.include_dataset(repo_id)
 
@@ -449,8 +452,55 @@ def run_once(
     def hydrate(store: Store, batch: Record) -> None:
         checkpoint.hydrate_batch(store.root, batch["id"], frozen=batch["frozen"])
 
+    publication_errors: dict[str, str] = {}
+    publication_yielded = False
+    attempted_paths: set[Path] = set()
+
+    def publish_pending() -> bool:
+        nonlocal publication_yielded
+        if not publish_enabled:
+            return False
+        attempted = False
+        with Store(**runtime["storage"]) as store:
+            for batch in sorted(store.status(), key=lambda row: store.week(row["id"]).evidence_cutoff):
+                if cancel_event.is_set() or clock() >= stop_at:
+                    publication_yielded = True
+                    break
+                if (
+                    not batch["frozen"]
+                    or batch["kind"] not in {"formal", "bootstrap"}
+                    or store.week(batch["id"]).policy.read_only
+                ):
+                    continue
+                path = latest_path(store, batch["id"])
+                if path in attempted_paths or (path.parent / "publication.json").exists():
+                    continue
+                attempted = True
+                attempted_paths.add(path)
+                try:
+                    publish(
+                        store,
+                        path,
+                        **config["publication"],
+                        stop_at=stop_at,
+                        clock=clock,
+                        cancel_event=cancel_event,
+                    )
+                    publication_errors.pop(batch["id"], None)
+                except WorkYield:
+                    publication_yielded = True
+                    break
+                except StorageLimit:
+                    raise
+                except Exception as error:
+                    publication_errors[batch["id"]] = f"{type(error).__name__}:{error}"
+        return attempted
+
     try:
         guard.reserve({})
+        if restored:
+            # 这批输入已在上一 runner 耐久保存，先补发布，避免新来源扫描耗尽整轮预算。
+            publish_pending()
         result = tick(
             runtime, clock=clock, stop_at=stop_at, bootstrap=bootstrap, qualification=qualification, hydrate=hydrate
         )
@@ -466,10 +516,27 @@ def run_once(
         except StorageLimit as error:
             return paused(error)
         raise
+    tick_errors = dict(result["errors"])
+
+    def record_publication_state() -> None:
+        result["errors"] = tick_errors | publication_errors
+        result["yielded"] = result["yielded"] or publication_yielded
+        state = read_manifest(root / "scheduler.json")
+        state.update(last_error=result["errors"] or None, yielded=result["yielded"])
+        atomic_json(root / "scheduler.json", state)
+
+    record_publication_state()
     try:
         receipt = checkpoint.save(root)
     except StorageLimit as error:
         return paused(error)
+    try:
+        if publish_pending():
+            record_publication_state()
+            receipt = checkpoint.save(root)
+    except StorageLimit as error:
+        return paused(error)
+    result["yielded"] = result["yielded"] or cancel_event.is_set() or clock() >= stop_at
     return result | {"restored": restored, "checkpoint": receipt}
 
 

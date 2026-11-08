@@ -6,12 +6,15 @@ import hashlib
 import os
 import re
 import shutil
+import signal
 import sqlite3
 import tempfile
+import threading
 import time
 import zlib
-from collections.abc import Iterable, Iterator
-from contextlib import closing
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import closing, contextmanager
+from datetime import UTC, datetime
 from decimal import Decimal
 from importlib.resources import files as resource_files
 from itertools import groupby
@@ -25,8 +28,10 @@ from huggingface_hub import CommitOperationAdd, CommitOperationDelete, HfApi, hf
 
 from .contract import Record, Week, bound_tokens, digest, dumps, instant, settled_payouts, token_matches
 from .domains import PRIMARY_DOMAINS, event_group, grouping_record
+from .source import WorkYield
 from .store import (
     PARQUET_SCHEMA_VERSION,
+    SCHEMAS,
     Store,
     atomic_json,
     file_hash,
@@ -42,7 +47,80 @@ LEGACY_EXPORT_PATHS = {"basic.jsonl", "extended.jsonl"} | {
 }
 
 
-def write_comment_trees(output: TextIO, records: Iterable[Record]) -> None:
+class _PublicationInterrupted(KeyboardInterrupt):
+    """沿 HF SDK 的 KeyboardInterrupt 路径取消原生 Xet 传输。"""
+
+
+@contextmanager
+def _publication_budget(
+    stop_at: datetime | None, clock: Callable[[], datetime], cancel_event: threading.Event | None
+) -> Iterator[Callable[[], None]]:
+    """发布占用工作预算；保留调用方更早的硬截止和原信号处理器。"""
+    started = time.monotonic()
+    remaining = max(0.0, (stop_at - clock()).total_seconds()) if stop_at else None
+    deadline = started + remaining if remaining is not None else None
+
+    def expired() -> bool:
+        return (
+            deadline is not None
+            and time.monotonic() >= deadline
+            or stop_at is not None
+            and clock() >= stop_at
+            or cancel_event is not None
+            and cancel_event.is_set()
+        )
+
+    def check() -> None:
+        if expired():
+            raise WorkYield("runner_work_budget")
+
+    check()
+    if stop_at is None and cancel_event is None:
+        yield check
+        return
+    if threading.current_thread() is not threading.main_thread() or not hasattr(signal, "setitimer"):
+        raise RuntimeError("bounded_publication_requires_main_thread_and_posix_timer")
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_remaining, previous_interval = signal.getitimer(signal.ITIMER_REAL)
+    previous_deadline = time.monotonic() + previous_remaining if previous_remaining else None
+
+    def arm() -> None:
+        limits = [0.25]
+        if deadline is not None:
+            limits.append(deadline - time.monotonic())
+        if previous_deadline is not None:
+            limits.append(previous_deadline - time.monotonic())
+        signal.setitimer(signal.ITIMER_REAL, max(0.000001, min(limits)))
+
+    def interrupt(signum: int, frame: Any) -> None:
+        nonlocal previous_deadline
+        if previous_deadline is not None and time.monotonic() >= previous_deadline:
+            previous_deadline = time.monotonic() + previous_interval if previous_interval else None
+            if callable(previous_handler):
+                previous_handler(signum, frame)
+            elif previous_handler == signal.SIG_DFL:
+                signal.signal(signum, previous_handler)
+                signal.raise_signal(signum)
+        if expired():
+            raise _PublicationInterrupted()
+        arm()
+
+    try:
+        signal.signal(signal.SIGALRM, interrupt)
+        arm()
+        yield check
+    except _PublicationInterrupted:
+        raise WorkYield("runner_work_budget") from None
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        if previous_deadline is not None:
+            signal.setitimer(signal.ITIMER_REAL, max(0.000001, previous_deadline - time.monotonic()), previous_interval)
+
+
+def write_comment_trees(
+    output: TextIO, records: Iterable[Record], *, check_budget: Callable[[], None] = lambda: None
+) -> None:
     """用临时索引流式输出回复树；内存只随嵌套深度增长。"""
     with tempfile.TemporaryDirectory(prefix="foreseebench-comments-") as temporary:
         db = sqlite3.connect(Path(temporary) / "comments.sqlite")
@@ -50,6 +128,7 @@ def write_comment_trees(output: TextIO, records: Iterable[Record]) -> None:
             db.execute("CREATE TABLE comments (id TEXT PRIMARY KEY,parent TEXT,created TEXT,payload TEXT)")
             total = 0
             for row in records:
+                check_budget()
                 if not row.get("comment_id"):
                     raise ValueError("comment_id_missing")
                 try:
@@ -70,6 +149,7 @@ def write_comment_trees(output: TextIO, records: Iterable[Record]) -> None:
                 cursor = db.execute(f"SELECT id,payload FROM comments c WHERE {condition} ORDER BY created,id")
                 stack = [(cursor, False)]
                 while stack:
+                    check_budget()
                     cursor, emitted = stack[-1]
                     entry = cursor.fetchone()
                     if entry is None:
@@ -269,6 +349,7 @@ def export_jsonl(
     view: Literal["full", "balanced"] = "full",
     include_event_ids: set[str] | None = None,
     row_offsets: dict[str, tuple[int, int]] | None = None,
+    check_budget: Callable[[], None] = lambda: None,
 ) -> None:
     """逐条写入大数组；内存不随单题评论或成交总量增长。"""
     if view not in {"full", "balanced"}:
@@ -286,6 +367,7 @@ def export_jsonl(
             streams[table] = groupby(read_records(root, manifest, table), key=lambda r: r["event_id"])
             heads[table] = next(streams[table], (None, ()))
     for event, label in event_results(root, manifest):
+        check_budget()
         original = metadata[event["source_hash"]]
         if any(event[key] != original[key] for key in ("event_id", "question", "description")):
             raise ValueError("frozen_event_metadata_mismatch")
@@ -357,13 +439,14 @@ def export_jsonl(
                 raise ValueError("orphaned_payload_event")
             if table == "comments":
                 if key == event["event_id"]:
-                    write_comment_trees(output, rows)
+                    write_comment_trees(output, rows, check_budget=check_budget)
                 else:
                     output.write(',"comments":[],"orphan_replies":[]')
             else:
                 output.write("," + dumps(field) + ":[")
                 first = True
                 for row in rows if key == event["event_id"] else ():
+                    check_budget()
                     item = dict(row)
                     for number in ("price_per_share", "shares"):
                         item[number] = Decimal(item[number]) if item[number] is not None else None
@@ -381,7 +464,8 @@ def export_jsonl(
         raise ValueError("orphaned_payload_event")
 
 
-def validate_export(path: Path, expected: Record) -> Record:
+def validate_export(path: Path, expected: Record, *, check_budget: Callable[[], None] = lambda: None) -> Record:
+    check_budget()
     counts = {"events": 0, "comments": 0, "trades": 0}
     if path.stat().st_size == 0:
         if counts != expected:
@@ -392,6 +476,7 @@ def validate_export(path: Path, expected: Record) -> Record:
     comment_node = re.compile(r"(?:comments|orphan_replies)\.item(?:\.replies\.item)*")
     with path.open("rb") as stream:
         for prefix, event, value in ijson.parse(stream, multiple_values=True, use_float=False):
+            check_budget()
             if prefix == "" and event == "end_map":
                 counts["events"] += 1
             elif event == "end_map" and comment_node.fullmatch(prefix):
@@ -554,7 +639,15 @@ def git_blob_hash(path: Path) -> str:
     return hasher.hexdigest()
 
 
-def write_view_shards(root: Path, view: str, name: str, records: dict[str, Record], target_bytes: int) -> list[Record]:
+def write_view_shards(
+    root: Path,
+    view: str,
+    name: str,
+    records: dict[str, Record],
+    target_bytes: int,
+    *,
+    check_budget: Callable[[], None] = lambda: None,
+) -> list[Record]:
     """按稳定来源哈希分区复制完整行；单Event超目标时独占一个分片。"""
     partitions: dict[str, list[str]] = {}
     for identifier, record in records.items():
@@ -564,6 +657,7 @@ def write_view_shards(root: Path, view: str, name: str, records: dict[str, Recor
         partitions["empty"] = []
     entries = []
     for partition, identifiers in sorted(partitions.items()):
+        check_budget()
         identifiers.sort(key=lambda key: (hashlib.sha256(records[key]["source_id"].encode()).hexdigest(), key))
         groups: list[list[str]] = [[]]
         size = 0
@@ -588,6 +682,7 @@ def write_view_shards(root: Path, view: str, name: str, records: dict[str, Recor
                         source.seek(record["offset"])
                         remaining = record["bytes"]
                         while remaining:
+                            check_budget()
                             chunk = source.read(min(1024 * 1024, remaining))
                             if not chunk:
                                 raise ValueError("export_record_truncated")
@@ -597,7 +692,7 @@ def write_view_shards(root: Path, view: str, name: str, records: dict[str, Recor
                         counts[key] += record["counts"][key]
                 output.flush()
                 os.fsync(output.fileno())
-            validate_export(path, counts)
+            validate_export(path, counts, check_budget=check_budget)
             checksum = file_hash(path)
             final = destination / f"{checksum}.jsonl"
             os.replace(path, final)
@@ -622,19 +717,28 @@ def write_view_shards(root: Path, view: str, name: str, records: dict[str, Recor
 
 
 def build_exports(
-    store: Store, index: Record, repo_id: str, revision: str, *, target_bytes: int = 128 * 1024**2
+    store: Store,
+    index: Record,
+    repo_id: str,
+    revision: str,
+    *,
+    target_bytes: int = 128 * 1024**2,
+    check_budget: Callable[[], None] = lambda: None,
 ) -> list[Record]:
     """仅构建变化成员涉及的分片；历史快照的轻量目录与已发布视图可直接复用。"""
     if target_bytes <= 0:
         raise ValueError("invalid_export_shard_size")
+    implementation_hash = implementation_provenance()["implementation_hash"]
+    same_implementation = index.get("export_implementation_hash") == implementation_hash
     layout = {"version": "source_id_sha256_v1", "partition_hex_chars": 1, "target_bytes": target_bytes}
-    previous_exports = index.get("exports", []) if index.get("export_layout") == layout else []
-    previous_members = index.get("export_members", {})
-    previous_catalog = index.get("export_catalog", {})
+    previous_exports = index.get("exports", []) if same_implementation and index.get("export_layout") == layout else []
+    previous_members = index.get("export_members", {}) if same_implementation else {}
+    previous_catalog = index.get("export_catalog", {}) if same_implementation else {}
     snapshots: dict[str, Record] = {}
 
     def hydrate(manifest: Record, tables: set[str]) -> None:
         for entry in manifest["files"]:
+            check_budget()
             if entry["table"] not in tables:
                 continue
             path = (store.root / entry["path"]).resolve()
@@ -653,6 +757,7 @@ def build_exports(
                 raise ValueError("export_input_checksum_mismatch")
 
     def snapshot(batch_id: str) -> Record:
+        check_budget()
         if batch_id not in snapshots:
             entry = index["batches"][batch_id]
             path = (store.root / entry["manifest"]).resolve()
@@ -674,6 +779,7 @@ def build_exports(
     catalog: dict[str, Record] = {}
     chosen: dict[str, Record] = {}
     for batch_id, entry in sorted(index["batches"].items()):
+        check_budget()
         prior = previous_catalog.get(batch_id, {})
         if prior.get("manifest_hash") == entry["manifest_hash"]:
             catalog[batch_id] = prior
@@ -684,6 +790,7 @@ def build_exports(
             formal = {row["event_id"] for row in (manifest.get("benchmark_selection") or {}).get("members", [])}
             members: dict[str, Record] = {}
             for event, label in event_results(store.root, manifest):
+                check_budget()
                 identifier = event["event_id"]
                 if identifier in members:
                     raise ValueError("duplicate_event_in_export")
@@ -714,6 +821,7 @@ def build_exports(
                 for table in ("comments", "trades"):
                     count = 0
                     for row in read_records(store.root, manifest, table):
+                        check_budget()
                         if row["event_id"] not in members:
                             raise ValueError("orphaned_payload_event")
                         members[row["event_id"]]["counts"][table] += 1
@@ -746,11 +854,13 @@ def build_exports(
     cached_shards: dict[str, Path] = {}
     with tempfile.TemporaryDirectory(dir=destination) as temporary:
         for name in ("basic", "extended"):
+            check_budget()
             desired = {"full": set(chosen), "balanced": {key for key, value in chosen.items() if value["balanced"]}}
             retained: dict[str, list[Record]] = {"full": [], "balanced": []}
             assigned: dict[str, set[str]] = {"full": set(), "balanced": set()}
             old_ranges: dict[str, dict[str, Record]] = {"full": {}, "balanced": {}}
             for entry in previous_exports:
+                check_budget()
                 if entry["format"] != name:
                     continue
                 view = entry["view"]
@@ -788,6 +898,7 @@ def build_exports(
                         extended=name == "extended",
                         include_event_ids=ids,
                         row_offsets=offsets,
+                        check_budget=check_budget,
                     )
                 if set(offsets) != ids:
                     raise ValueError("export_input_count_mismatch")
@@ -797,6 +908,7 @@ def build_exports(
             for view in desired:
                 records = {}
                 for key in sorted(desired[view] - assigned[view]):
+                    check_budget()
                     record = generated.get(key)
                     if record is None:
                         row = old_ranges[view].get(key) or old_ranges["full"][key]
@@ -815,7 +927,9 @@ def build_exports(
                     records[key] = dict(record, source_id=chosen[key]["source_id"], counts=counts)
                 exports.extend(retained[view])
                 if records or not retained[view]:
-                    exports.extend(write_view_shards(store.root, view, name, records, target_bytes))
+                    exports.extend(
+                        write_view_shards(store.root, view, name, records, target_bytes, check_budget=check_budget)
+                    )
     exports.sort(key=lambda entry: (entry["view"], entry["format"], entry["partition"], entry["path"]))
     statistics: Record = {
         "schema_version": "1.0",
@@ -849,7 +963,7 @@ def build_exports(
     index["export_layout"] = layout
     index["export_catalog"] = catalog
     index["export_members"] = chosen
-    index["export_implementation_hash"] = implementation_provenance()["implementation_hash"]
+    index["export_implementation_hash"] = implementation_hash
     return exports
 
 
@@ -986,19 +1100,45 @@ def dataset_card(index: Record, language: Literal["zh", "en"] = "zh") -> str:
     return "\n".join(lines) + body
 
 
-def publish(store: Store, manifest_path: Path, repo_id: str, revision: str = "main") -> Record:
+def publish(
+    store: Store,
+    manifest_path: Path,
+    repo_id: str,
+    revision: str = "main",
+    *,
+    stop_at: datetime | None = None,
+    clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+    cancel_event: threading.Event | None = None,
+) -> Record:
     """从不可变快照重试发布；提交后断连通过远端manifest恢复回执。"""
-    for attempt in range(5):
-        try:
-            return _publish_once(store, manifest_path, repo_id, revision)
-        except Exception as error:
-            response = getattr(error, "response", None)
-            retryable = isinstance(error, httpx.TransportError) or (
-                response is not None and (response.status_code in {409, 429} or response.status_code >= 500)
-            )
-            if not retryable or attempt == 4:
-                raise
-            time.sleep(min(30, 2**attempt))
+
+    with _publication_budget(stop_at, clock, cancel_event) as check_budget:
+        for attempt in range(5):
+            check_budget()
+            try:
+                return _publish_once(
+                    store,
+                    manifest_path,
+                    repo_id,
+                    revision,
+                    check_budget=check_budget,
+                    bounded=stop_at is not None or cancel_event is not None,
+                )
+            except Exception as error:
+                response = getattr(error, "response", None)
+                retryable = isinstance(error, httpx.TransportError) or (
+                    response is not None and (response.status_code in {409, 429} or response.status_code >= 500)
+                )
+                if not retryable or attempt == 4:
+                    raise
+                check_budget()
+                delay = min(30.0, 2.0**attempt)
+                if stop_at is not None:
+                    delay = min(delay, max(0.0, (stop_at - clock()).total_seconds()))
+                if cancel_event is not None:
+                    cancel_event.wait(delay)
+                else:
+                    time.sleep(delay)
     raise RuntimeError("publication_retry_exhausted")
 
 
@@ -1009,6 +1149,7 @@ def verify_published_views(
     *,
     previous: Record | None = None,
     required_readback: set[str] | None = None,
+    check_budget: Callable[[], None] = lambda: None,
 ) -> dict[str, str]:
     """变化对象实读SHA256；复用对象核验不可变commit中的Hub内容哈希。"""
     known = {entry["path"]: entry for entry in (previous or {}).get("exports", [])}
@@ -1027,6 +1168,7 @@ def verify_published_views(
         api = HfApi()
         paths = list(reused)
         for start in range(0, len(paths), 100):
+            check_budget()
             batch = paths[start : start + 100]
             remote = api.get_paths_info(repo_id, batch, repo_type="dataset", revision=revision)
             by_path = {item.path: item for item in remote}
@@ -1041,6 +1183,7 @@ def verify_published_views(
                     raise ValueError(f"remote_view_readback_failed:{path}")
                 verified[path] = entry["sha256"]
     for entry in entries:
+        check_budget()
         if entry["path"] in verified:
             continue
         path = Path(hf_hub_download(repo_id, entry["path"], repo_type="dataset", revision=revision))
@@ -1073,22 +1216,38 @@ def pending_readback(store: Store, index: Record, repo_id: str, branch: str, rec
     return pending
 
 
-def _publish_once(store: Store, manifest_path: Path, repo_id: str, revision: str = "main") -> Record:
+def _publish_once(
+    store: Store,
+    manifest_path: Path,
+    repo_id: str,
+    revision: str = "main",
+    *,
+    check_budget: Callable[[], None] = lambda: None,
+    bounded: bool = False,
+) -> Record:
+    check_budget()
     manifest_path = manifest_path.resolve()
     if not manifest_path.is_relative_to(store.root):
         raise ValueError("manifest_outside_store")
     manifest = read_manifest(manifest_path)
+    for entry in manifest["files"]:
+        check_budget()
+        if entry["table"] in SCHEMAS and not (store.root / entry["path"]).is_file():
+            store.resolve_file(entry)
     store.verify(manifest)
     if manifest["kind"] == "qualification" and revision == "main":
         raise ValueError("qualification_cannot_publish_to_main")
     if manifest["kind"] != "qualification" and not manifest.get("construction_complete"):
         raise ValueError("construction_incomplete")
     api = HfApi()
+    check_budget()
     info = api.repo_info(repo_id, repo_type="dataset", revision=revision)
     if info.sha is None:
         raise ValueError("remote_revision_missing")
     previous: Record = {"batches": {}}
+    check_budget()
     if api.file_exists(repo_id, "manifest.json", repo_type="dataset", revision=info.sha):
+        check_budget()
         previous = read_manifest(
             Path(hf_hub_download(repo_id, "manifest.json", repo_type="dataset", revision=info.sha))
         )
@@ -1105,15 +1264,19 @@ def _publish_once(store: Store, manifest_path: Path, repo_id: str, revision: str
         cards = {name: dataset_card(previous, language).encode() for language, name in CARD_FILES.items()}
         card_updates = []
         for name, content in cards.items():
+            check_budget()
             if api.file_exists(repo_id, name, repo_type="dataset", revision=info.sha):
+                check_budget()
                 current = Path(hf_hub_download(repo_id, name, repo_type="dataset", revision=info.sha))
                 if current.read_bytes() == content:
                     continue
             card_updates.append(CommitOperationAdd(path_in_repo=name, path_or_fileobj=content))
         head = info.sha
         if card_updates:
+            check_budget()
             if store.before_publish:
                 store.before_publish(list(card_updates))
+            check_budget()
             commit = api.create_commit(
                 repo_id,
                 repo_type="dataset",
@@ -1124,6 +1287,7 @@ def _publish_once(store: Store, manifest_path: Path, repo_id: str, revision: str
             )
             head = commit.oid
             for name, content in cards.items():
+                check_budget()
                 remote_card = Path(hf_hub_download(repo_id, name, repo_type="dataset", revision=head))
                 if remote_card.read_bytes() != content:
                     raise ValueError("remote_card_readback_failed")
@@ -1135,16 +1299,19 @@ def _publish_once(store: Store, manifest_path: Path, repo_id: str, revision: str
             "branch": revision,
             "unchanged": not card_updates,
             "verified_artifacts": verify_published_views(
-                repo_id, head, previous, previous=previous, required_readback=required
+                repo_id, head, previous, previous=previous, required_readback=required, check_budget=check_budget
             ),
         }
         atomic_json(manifest_path.parent / "publication.json", receipt)
         return receipt
     required = pending_readback(store, previous, repo_id, revision, manifest_path.parent / "publication.json")
     if required:
-        verify_published_views(repo_id, info.sha, previous, previous=previous, required_readback=required)
+        verify_published_views(
+            repo_id, info.sha, previous, previous=previous, required_readback=required, check_budget=check_budget
+        )
     index = publication_index(previous, manifest, relative_manifest)
-    index["exports"] = build_exports(store, index, repo_id, info.sha)
+    index["exports"] = build_exports(store, index, repo_id, info.sha, check_budget=check_budget)
+    check_budget()
     known = {f["path"]: f["sha256"] for b in previous.get("batches", {}).values() for f in b.get("files", [])}
     manifests = {relative_manifest: manifest}
     node = manifest
@@ -1155,6 +1322,10 @@ def _publish_once(store: Store, manifest_path: Path, repo_id: str, revision: str
         if file_hash(parent_path) != node.get("parent_manifest_sha256"):
             raise ValueError("parent_manifest_checksum_mismatch")
         node = read_manifest(parent_path)
+        for entry in node["files"]:
+            check_budget()
+            if entry["table"] in SCHEMAS and not (store.root / entry["path"]).is_file():
+                store.resolve_file(entry)
         store.verify(node)
         manifests[parent] = node
     files: dict[str, Record] = {}
@@ -1166,6 +1337,7 @@ def _publish_once(store: Store, manifest_path: Path, repo_id: str, revision: str
     operations: list[CommitOperationAdd | CommitOperationDelete] = []
     preuploads: list[CommitOperationAdd] = []
     for entry in files.values():
+        check_budget()
         if entry["path"] in known and known[entry["path"]] != entry["sha256"]:
             raise ValueError("immutable_remote_file_changed")
         if known.get(entry["path"]) == entry["sha256"]:
@@ -1183,12 +1355,14 @@ def _publish_once(store: Store, manifest_path: Path, repo_id: str, revision: str
         if known_views.get(entry["path"]) != entry["sha256"]
     ]
     for entry in [*index["exports"], index["statistics"]]:
+        check_budget()
         if known_views.get(entry["path"]) == entry["sha256"]:
             continue
         operation = CommitOperationAdd(path_in_repo=entry["path"], path_or_fileobj=store.root / entry["local_path"])
         operations.append(operation)
         preuploads.append(operation)
     for entry in previous.get("exports", []):
+        check_budget()
         if entry["path"] in LEGACY_EXPORT_PATHS and api.file_exists(
             repo_id, entry["path"], repo_type="dataset", revision=info.sha
         ):
@@ -1203,9 +1377,20 @@ def _publish_once(store: Store, manifest_path: Path, repo_id: str, revision: str
         for language, name in CARD_FILES.items()
     )
     if store.before_publish:
+        check_budget()
         store.before_publish(operations)
+    check_budget()
     if preuploads:
-        api.preupload_lfs_files(repo_id, additions=preuploads, repo_type="dataset", revision=revision)
+        # 有截止时让 LFS 也在主线程执行；线程池退出等待不能占用检查点宽限期。
+        groups = (
+            [[operation] for operation in operations if isinstance(operation, CommitOperationAdd)]
+            if bounded
+            else [preuploads]
+        )
+        for additions in groups:
+            check_budget()
+            api.preupload_lfs_files(repo_id, additions=additions, repo_type="dataset", revision=revision)
+    check_budget()
     commit = api.create_commit(
         repo_id,
         repo_type="dataset",
@@ -1214,6 +1399,7 @@ def _publish_once(store: Store, manifest_path: Path, repo_id: str, revision: str
         operations=operations,
         commit_message=f"{manifest['batch_id']} {manifest['stage']} verified snapshot",
     )
+    check_budget()
     remote = Path(hf_hub_download(repo_id, "manifest.json", repo_type="dataset", revision=commit.oid))
     if read_manifest(remote) != index:
         raise ValueError("remote_manifest_readback_failed")
@@ -1223,7 +1409,9 @@ def _publish_once(store: Store, manifest_path: Path, repo_id: str, revision: str
         "manifest_hash": digest(manifest),
         "branch": revision,
         "unchanged": False,
-        "verified_artifacts": verify_published_views(repo_id, commit.oid, index, previous=previous),
+        "verified_artifacts": verify_published_views(
+            repo_id, commit.oid, index, previous=previous, check_budget=check_budget
+        ),
     }
     atomic_json(manifest_path.parent / "publication.json", receipt)
     return receipt

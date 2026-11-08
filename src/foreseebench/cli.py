@@ -299,7 +299,16 @@ def advance_batch(
     if config["scheduler"]["publish"]:
         manifest_path = latest_path(store, week.id)
         if not (manifest_path.parent / "publication.json").exists():
-            log(publish(store, manifest_path, **config["publication"]))
+            log(
+                publish(
+                    store,
+                    manifest_path,
+                    **config["publication"],
+                    stop_at=stop_at,
+                    clock=clock,
+                    cancel_event=config.get("cancel_event"),
+                )
+            )
     if now >= week.freeze_at:
         closed = state.setdefault("gt_closed", {})
         if now >= week.evidence_cutoff:
@@ -329,7 +338,16 @@ def advance_batch(
     if config["scheduler"]["publish"]:
         manifest_path = latest_path(store, week.id)
         if not (manifest_path.parent / "publication.json").exists():
-            log(publish(store, manifest_path, **config["publication"]))
+            log(
+                publish(
+                    store,
+                    manifest_path,
+                    **config["publication"],
+                    stop_at=stop_at,
+                    clock=clock,
+                    cancel_event=config.get("cancel_event"),
+                )
+            )
 
 
 def parser() -> argparse.ArgumentParser:

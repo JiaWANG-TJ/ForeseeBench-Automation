@@ -312,6 +312,238 @@ def test_run_once_restores_progress_and_freezes_only_after_complete_source_censu
     assert ranges == ["1", "101"]
 
 
+def test_run_once_recovers_committed_first_publication_from_a_cold_runner(tmp_path, monkeypatch):
+    from datetime import timedelta
+
+    from test_contract import raw_event
+    from test_delivery import archive_event_source, fake_dataset_hub
+
+    from foreseebench import delivery
+    from foreseebench.cloud import CheckpointDeadline, run_once
+    from foreseebench.contract import Week, admit_event, digest, instant
+    from foreseebench.store import read_manifest
+
+    now = instant("2026-11-08T12:00:00Z")
+    week = Week.bootstrap(now)
+    initial = tmp_path / "initial"
+    raw = raw_event()
+    raw["markets"][0]["endDate"] = "2026-11-13T20:00:00Z"
+    archive_event_source(initial, raw, batch_id=week.id)
+    with Store(initial) as store:
+        store.begin(week, "bootstrap", "config")
+        source = admit_event(raw, week, now)
+        store.event(week.id, source["event_id"], source, "collected")
+        for kind in ("comments", "trades"):
+            store.page(week.id, source["event_id"], kind, "empty", [], None, True)
+        store.discovery_complete(week.id)
+    api = BucketAPI()
+    api.repositories["dataset", "owner/private"] = SimpleNamespace(private=True, used_storage=0)
+    BucketCheckpoint("owner/state", api=api).save(initial)
+    remote = tmp_path / "hub"
+    hub = fake_dataset_hub(remote, monkeypatch)
+
+    def interrupted(repo_id, filename, **kwargs):
+        if filename.startswith("balanced/basic/"):
+            raise CheckpointDeadline("runner_lost_after_commit")
+        return hub.download(repo_id, filename, **kwargs)
+
+    monkeypatch.setattr(delivery, "hf_hub_download", interrupted)
+    config = {
+        "storage": {"root": tmp_path / "first"},
+        "scheduler": {"publish": True, "poll_seconds": 300},
+        "publication": {"repo_id": "owner/private", "revision": "main"},
+        "config_hash": "config",
+    }
+    with pytest.raises(CheckpointDeadline, match="runner_lost_after_commit"):
+        run_once(config, BucketCheckpoint("owner/state", api=api), clock=lambda: now)
+    committed = read_manifest(remote / hub.head / "manifest.json")
+    binding = committed["batches"][week.id]
+    frozen = read_manifest(remote / hub.head / binding["manifest"])
+    hub.downloads.clear()
+    monkeypatch.setattr(delivery, "hf_hub_download", hub.download)
+    fresh = tmp_path / "cold-runner"
+    resumed = run_once(
+        dict(config, storage={"root": fresh}),
+        BucketCheckpoint("owner/state", api=api),
+        clock=lambda: now + timedelta(hours=1),
+    )
+    assert resumed["errors"] == {}
+    assert len(hub.commits) == 1
+    assert read_manifest(fresh / binding["manifest"]) == frozen
+    receipt = read_manifest((fresh / binding["manifest"]).parent / "publication.json")
+    assert receipt["manifest_hash"] == digest(frozen) == binding["manifest_hash"]
+    assert set(committed["updated_artifacts"]) <= {name for _, name in hub.downloads}
+    final = tmp_path / "receipt-check"
+    BucketCheckpoint("owner/state", api=api).restore(final)
+    assert read_manifest((final / binding["manifest"]).parent / "publication.json") == receipt
+
+
+def test_run_once_does_not_upload_when_export_exhausts_the_work_budget(tmp_path, monkeypatch):
+    import os
+    from datetime import timedelta
+
+    from test_delivery import fake_dataset_hub
+
+    from foreseebench.cloud import run_once
+    from foreseebench.contract import Week, instant
+
+    now = instant("2026-11-08T12:00:00Z")
+    week = Week.bootstrap(now)
+    with Store(tmp_path / "initial") as store:
+        store.begin(week, "bootstrap", "config")
+        store.discovery_complete(week.id)
+        store.freeze(week, now)
+    api = BucketAPI()
+    api.repositories["dataset", "owner/private"] = SimpleNamespace(private=True, used_storage=0)
+    BucketCheckpoint("owner/state", api=api).save(tmp_path / "initial")
+    hub = fake_dataset_hub(tmp_path / "hub", monkeypatch)
+    current = {"now": now, "exporting": False}
+    repo_info, fsync = hub.repo_info, os.fsync
+
+    def lookup(*args, **kwargs):
+        current["exporting"] = True
+        return repo_info(*args, **kwargs)
+
+    def slow_disk(fd):
+        fsync(fd)
+        if current["exporting"]:
+            current["now"] = now + timedelta(seconds=11)
+
+    monkeypatch.setattr(hub, "repo_info", lookup)
+    monkeypatch.setattr(os, "fsync", slow_disk)
+    result = run_once(
+        {
+            "storage": {"root": tmp_path / "runner"},
+            "scheduler": {"publish": True, "poll_seconds": 300},
+            "publication": {"repo_id": "owner/private", "revision": "main"},
+            "config_hash": "config",
+        },
+        BucketCheckpoint("owner/state", api=api),
+        work_seconds=10,
+        clock=lambda: current["now"],
+    )
+    assert current["now"] == now + timedelta(seconds=11)
+    assert hub.preuploads == []
+    assert hub.commits == []
+    assert result["yielded"] and result["errors"] == {}
+    assert result["checkpoint"]["generation"]
+    restored = tmp_path / "next-runner"
+    BucketCheckpoint("owner/state", api=api).restore(restored)
+    with Store(restored) as store:
+        assert store.batch(week.id)["frozen"]
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_run_once_publishes_a_closed_batch_from_sparse_checkpoint_state(tmp_path, monkeypatch, legacy):
+    from test_delivery import fake_dataset_hub
+
+    from foreseebench.cloud import run_once
+    from foreseebench.contract import Week, instant, stamp
+    from foreseebench.store import atomic_json, read_manifest
+
+    week = Week.bootstrap(instant("2026-11-08T12:00:00Z"))
+    initial = tmp_path / "initial"
+    with Store(initial) as store:
+        store.begin(week, "bootstrap", "config")
+        store.discovery_complete(week.id)
+        store.freeze(week, week.collection_start)
+        store.release_results(week, week.evidence_cutoff)
+    if legacy:
+        protocol = week.record()
+        protocol["policy"].pop("domain_event_cap")
+        protocol["policy"].update(target_events=1000, minimum_events=500)
+        atomic_json(initial / "batches" / week.id / "protocol.json", protocol)
+    atomic_json(
+        initial / "scheduler.json",
+        {"last_refresh": {}, "gt_closed": {week.id: {"deadline": stamp(week.evidence_cutoff)}}},
+    )
+    api = BucketAPI()
+    api.repositories["dataset", "owner/private"] = SimpleNamespace(private=True, used_storage=0)
+    BucketCheckpoint("owner/state", api=api).save(initial)
+    hub = fake_dataset_hub(tmp_path / "hub", monkeypatch)
+    result = run_once(
+        {
+            "storage": {"root": tmp_path / "runner"},
+            "scheduler": {"publish": True, "poll_seconds": 300},
+            "publication": {"repo_id": "owner/private", "revision": "main"},
+            "config_hash": "config",
+        },
+        BucketCheckpoint("owner/state", api=api),
+        clock=lambda: week.finalize_at,
+    )
+    assert result["errors"] == {}
+    if legacy:
+        assert hub.commits == []
+        return
+    assert len(hub.commits) == 1
+    remote = read_manifest(tmp_path / "hub" / hub.head / "manifest.json")
+    assert remote["batches"][week.id]["stage"] == "V3"
+
+
+def test_run_once_finishes_durable_publication_before_a_new_census_exhausts_the_budget(tmp_path, monkeypatch):
+    from datetime import timedelta
+
+    import httpx
+    from test_delivery import fake_dataset_hub
+
+    from foreseebench.cloud import run_once
+    from foreseebench.contract import Week, instant, stamp
+    from foreseebench.store import atomic_json, read_manifest
+
+    week = Week.parse("2026-10-26")
+    initial = tmp_path / "initial"
+    with Store(initial) as store:
+        store.begin(week, "formal", "config")
+        store.discovery_complete(week.id)
+        store.freeze(week, week.freeze_at)
+        store.release_results(week, week.evidence_cutoff)
+    atomic_json(
+        initial / "scheduler.json",
+        {"last_refresh": {}, "gt_closed": {week.id: {"deadline": stamp(week.evidence_cutoff)}}},
+    )
+    api = BucketAPI()
+    api.repositories["dataset", "owner/private"] = SimpleNamespace(private=True, used_storage=0)
+    BucketCheckpoint("owner/state", api=api).save(initial)
+    hub = fake_dataset_hub(tmp_path / "hub", monkeypatch)
+    now = instant("2026-11-09T17:00:00Z")
+    current = {"now": now}
+    requests = []
+
+    def source(request):
+        requests.append(request.url.path)
+        current["now"] = now + timedelta(seconds=11)
+        return httpx.Response(200, json={"events": [{"id": "101"}]})
+
+    result = run_once(
+        {
+            "storage": {"root": tmp_path / "runner"},
+            "scheduler": {"publish": True, "poll_seconds": 300},
+            "publication": {"repo_id": "owner/private", "revision": "main"},
+            "config_hash": "config",
+            "network": {
+                "gamma_url": "https://source.invalid",
+                "data_url": "https://source.invalid",
+                "timeout_seconds": 1,
+                "attempts": 1,
+                "requests_per_second": 1e9,
+                "workers": 1,
+                "transport_factory": lambda: httpx.MockTransport(source),
+            },
+        },
+        BucketCheckpoint("owner/state", api=api),
+        work_seconds=10,
+        clock=lambda: current["now"],
+    )
+    assert requests
+    assert result["yielded"] and result["errors"] == {}
+    assert len(hub.commits) == 1
+    remote = read_manifest(tmp_path / "hub" / hub.head / "manifest.json")
+    assert remote["batches"][week.id]["stage"] == "V3"
+    restored = tmp_path / "next-runner"
+    BucketCheckpoint("owner/state", api=api).restore(restored)
+    assert (restored / Path(remote["batches"][week.id]["manifest"]).parent / "publication.json").is_file()
+
+
 def test_qualification_namespace_cannot_read_or_gc_production_objects(tmp_path):
     from foreseebench.store import atomic_json
 
