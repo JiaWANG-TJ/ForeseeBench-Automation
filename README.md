@@ -32,6 +32,16 @@ GitHub schedules can be delayed or missed. Batch state and actual UTC time deter
 
 Public standard runners are free under GitHub's current rules. HF storage is bounded by the account's allowance; the default deployment does not enable paid compute or storage upgrades. Unknown or insufficient storage headroom stops new writes and is reported. See [GitHub limits](https://docs.github.com/en/actions/reference/limits) and [HF storage plans](https://huggingface.co/docs/hub/storage-limits).
 
+The storage allowances apply to different resources:
+
+| Resource | Purpose and capacity |
+| --- | --- |
+| GitHub Actions artifacts | The Free plan includes 500 MB, shared with Packages. This workflow does not upload weekly datasets as artifacts; dependency caches have a separate allowance. |
+| Runner temporary disk | Standard `ubuntu-24.04` runners provide 14 GB. Each job gets fresh storage; restore loads control files first and retrieves batch files as needed. Peak database, archive, export, and dependency usage must fit during that job. |
+| HF Dataset and private Bucket | Persistent snapshots and resumable state. HF lists 100 GB of private storage for free accounts. The application pauses before its visible usage plus reserved writes reaches 90 GB; this is a conservative guard, not the platform's billing meter. |
+
+Sources: [GitHub storage billing](https://docs.github.com/en/billing/concepts/product-billing/github-actions), [runner specifications](https://docs.github.com/en/actions/reference/runners/github-hosted-runners), and [HF storage plans](https://huggingface.co/docs/hub/storage-limits). Capacity planning must include raw responses, Parquet, JSONL, versioned snapshots, and working state. A 1 GB weekly download does not establish 1 GB of total weekly storage growth. The two-generation checkpoint policy removes unreferenced temporary objects; it preserves referenced historical data.
+
 ## Weekly timing
 
 All times are UTC. The schedule is configured in [`foreseebench.toml`](foreseebench.toml).
@@ -54,8 +64,9 @@ An initial `bootstrap` starts at its real creation time, allows 18 hours for com
 1. Use this public source repository and a writable HF Dataset plus a private HF Bucket.
 2. Set the Dataset in `foreseebench.toml` and the Bucket/Dataset identifiers in `.github/workflows/cloud.yml`.
 3. Add the authorized `HF_TOKEN` as a GitHub Actions secret. Never commit credentials or working data.
-4. Run the workflow manually in `qualification` mode. Re-run the same workflow execution to verify recovery from a fresh runner.
-5. Set the repository variable `FORESEEBENCH_ENABLED=true` to enable production. Set it to `false` to pause subsequent scheduled runs.
+4. Run `Hosted runner readiness` manually and confirm `FORESEEBENCH_RUNNER_OK` in its log. A billing-lock failure before any step runs requires account resolution through [GitHub's documented process](https://docs.github.com/en/billing/how-tos/troubleshooting/locked-account); buying storage does not establish runner readiness.
+5. Run the cloud workflow manually in `qualification` mode. Re-run the same workflow execution to verify recovery from a fresh runner.
+6. After both checks pass, set the repository variable `FORESEEBENCH_ENABLED=true` to enable production. Set it to `false` to pause subsequent scheduled runs.
 
 The workflow supplies `--bootstrap` when no batch exists, then follows the weekly schedule. Qualification uses an isolated Bucket prefix and never publishes production data.
 

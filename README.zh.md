@@ -32,6 +32,16 @@ GitHub定时触发可能延迟或漏跑，程序依据批次状态及真实UTC�
 
 按GitHub当前规则，公开仓库标准runner免费；HF存储受账户额度约束。本部署不启用付费计算或存储升级，用量未知或空间余量不足时停止新增写入并报告。参见[GitHub限制](https://docs.github.com/en/actions/reference/limits)与[HF存储额度](https://huggingface.co/docs/hub/storage-limits)。
 
+三种空间分别用于不同环节：
+
+| 空间 | 用途与容量 |
+| --- | --- |
+| GitHub Actions制品 | Free计划包含500MB，与Packages共享。本工作流不把每周数据上传为制品；依赖缓存另有额度。 |
+| runner临时磁盘 | 标准`ubuntu-24.04`提供14GB。每次任务使用新磁盘，恢复时先下载控制文件，再按需取回批次文件；数据库、归档、导出及依赖的运行峰值须能装入当次磁盘。 |
+| HF Dataset与私有Bucket | 长期保存快照及可恢复状态。HF公布的免费私有存储为100GB；程序在可见用量加预留写入达到90GB前暂停。这是保守保护阈值，不是平台计费读数。 |
+
+依据：[GitHub存储计费](https://docs.github.com/en/billing/concepts/product-billing/github-actions)、[runner规格](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)及[HF存储额度](https://huggingface.co/docs/hub/storage-limits)。容量估算必须包含原始响应、Parquet、JSONL、版本快照与工作状态；每周下载1GB不代表全部存储只增加1GB。两代检查点策略只删除不再被引用的临时对象，被引用的历史数据继续保留。
+
 ## 每周时间安排
 
 全部使用UTC，参数集中在[`foreseebench.toml`](foreseebench.toml)。
@@ -54,8 +64,9 @@ GitHub定时触发可能延迟或漏跑，程序依据批次状态及真实UTC�
 1. 使用公开源码仓库、有写入权限的HF Dataset和私有HF Bucket。
 2. 在`foreseebench.toml`设置Dataset，并在`.github/workflows/cloud.yml`设置Bucket及Dataset标识。
 3. 将授权的`HF_TOKEN`配置为GitHub Actions Secret，不提交凭据或工作数据。
-4. 手动运行`qualification`模式，再重跑同一次工作流执行，验证从新的runner恢复检查点。
-5. 将仓库变量`FORESEEBENCH_ENABLED`设为`true`启用生产；设为`false`暂停后续定时运行。
+4. 手动运行`Hosted runner readiness`，确认日志实际出现`FORESEEBENCH_RUNNER_OK`。若执行步骤为0并报告billing lock，须按[GitHub官方流程](https://docs.github.com/en/billing/how-tos/troubleshooting/locked-account)解除账户限制；购买存储不能证明runner已经可用。
+5. 手动运行云端工作流的`qualification`模式，再重跑同一次执行，验证从新的runner恢复检查点。
+6. 两项检查通过后，将仓库变量`FORESEEBENCH_ENABLED`设为`true`启用生产；设为`false`暂停后续定时运行。
 
 首次没有批次时，工作流以`--bootstrap`启动，随后遵循每周日程。工程核验使用独立Bucket前缀，不发布正式数据。
 

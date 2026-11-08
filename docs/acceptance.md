@@ -33,6 +33,18 @@ GitHub官方说明：失败的付款预授权也可能锁住免费Actions，即�
 
 旧本机服务已按PID、启动时钟、argv和cwd核对后停止，未继续在当前资源启动新采集。
 
+### 账户截图与容量复核
+
+用户提供的账单截图显示GitHub Free、Actions计费为0、计算用量不足0.01美元（包含12美元），制品存储0.2/0.5GB；不能据此认定欠费或额度耗尽。自动化仓库实时API返回制品数0、缓存数0及缓存占用0字节。截图是账户汇总，不能把其中0.2GB归属于本仓库。账户锁的具体触发原因仍需GitHub核实。
+
+收到截图后的[复测42505605260](https://github.com/JiaWANG-TJ/ForeseeBench-Automation/actions/runs/42505605260)在17:34:06—17:34:09 UTC再次失败；runner名称为空、执行步骤为0，注释仍为`The job was not started because your account is locked due to a billing issue.`。本地YAML及最小任务的Bash语法检查通过，三个工作流均未配置制品上传；这些静态结果不改变真实托管检查失败的结论。
+
+2026-11-08 17:32:47 UTC通过生产代码的只读容量检查测得：私有仓库与Bucket可见用量共8,013,325,428字节，其中本Dataset的`used_storage`为8,011,537,619字节；main当前文件共17,749字节，Bucket为0字节。再次核验Dataset仅有main、1个提交且无标签；清理后的配额读数尚未归零，不再重复删除数据。[HF说明](https://huggingface.co/docs/hub/storage-limits#super-squash-your-repository-using-the-api)允许清理后36小时内刷新配额。
+
+GitHub的500MB额度用于制品，runner另有14GB临时磁盘；本项目长期数据存入HF。[GitHub计费](https://docs.github.com/en/billing/concepts/product-billing/github-actions)与[runner规格](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)分别说明这两种空间。HF公布免费私有存储100GB，程序使用90,000,000,000字节保守停止阈值，留出写入余量。[HF额度](https://huggingface.co/docs/hub/storage-limits)
+
+以当前可见用量和90GB阈值计算，若全部持久文件每周净增1GB，余量约82周；若净增3GB，约27周。这是条件计算，不能把单份导出大小当作总增长率。原始响应、数据库、版本快照和四种视图都需要计量；真实runner的临时磁盘峰值及一周总增长仍未实测。恢复逻辑只先下载控制文件，批次大文件按需下载；检查点保留两代所引用的对象，全部历史快照不会因此只保留两周。
+
 ## 历史清理
 
 | 范围 | 实际结果 |
