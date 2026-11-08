@@ -1,0 +1,17 @@
+name: Hosted runner readiness
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  runner-check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Verify hosted execution
+        shell: bash
+        run: |
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          printf '%s\n' 'FORESEEBENCH_RUNNER_OK'
