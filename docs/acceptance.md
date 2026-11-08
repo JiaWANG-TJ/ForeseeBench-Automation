@@ -19,6 +19,18 @@
 
 私有Bucket`SII-JiaWANG/ForeseeBench-state`已创建。控制端对真实HF用量接口的只读预检通过；这不能替代GitHub上的状态保存与冷启动恢复。账户恢复后须用最终代码重新启动资格验证，并重跑同一执行验证恢复，再启用生产。
 
+### 最小托管执行复测
+
+针对失败通知，新增只允许手动触发的`runner-check.yml`：不用checkout、第三方action、项目代码、依赖、密钥或数据，只检查执行环境并输出`FORESEEBENCH_RUNNER_OK`。
+
+[运行42503711841](https://github.com/JiaWANG-TJ/ForeseeBench-Automation/actions/runs/42503711841)于2026-11-08 17:11:30—17:11:32 UTC失败；runner名称为空，执行步骤为0，GitHub再次返回同一billing lock注释。`gh run watch 42503711841 --repo JiaWANG-TJ/ForeseeBench-Automation --exit-status`返回1，未通过就绪验证。
+
+同时核验仓库为public、未禁用或归档，Actions启用且允许action，工作流active，无自托管runner，所需Secret名称存在；6个关键运行文件与公开仓库逐字节一致。因此，这次失败发生在项目代码执行之前，不能通过修改采集逻辑解除，也不能声称业务端到端已经可用。
+
+GitHub官方说明：失败的付款预授权也可能锁住免费Actions，即使账单页面没有有效订阅或余额。若没有可处理项，应向GitHub支持请求复核账户锁；本项目不要求为公开标准runner购买付费计划。[官方处理路径](https://docs.github.com/en/billing/how-tos/troubleshooting/locked-account)
+
+解锁后先重跑最小就绪检查并确认标志实际出现，再执行真实PM/HF资格验证及冷启动恢复，最后启用生产。源代码修改和本地测试不能替代这三个运行步骤。
+
 旧本机服务已按PID、启动时钟、argv和cwd核对后停止，未继续在当前资源启动新采集。
 
 ## 历史清理
