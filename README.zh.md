@@ -93,7 +93,7 @@ uv run foreseebench download-view --repo SII-JiaWANG/ForeseeBench   --format ext
 
 ## 模型接口
 
-指定模型为启智平台vLLM部署的DeepSeek-V4.1-Flash-1017。运行命令见[`scripts/qz-serving-command.sh`](scripts/qz-serving-command.sh)，真正权重由显式路径确定，不由平台占位模型选择项决定。
+指定模型为启智平台vLLM部署的DeepSeek-V4.1-Flash-1017。将[`scripts/qz-serving-command.sh`](scripts/qz-serving-command.sh)的内容用非登录`bash -c`提交，保留镜像环境；容器无需挂载本代码仓库。真正权重由显式路径确定，不由平台占位模型选择项决定。
 
 手动`LLM interface probe`工作流从GitHub Secrets读取`LLM_BASE_URL`、`LLM_API_KEY`，检查模型身份、普通回答、JSON Schema输出及思考模式最终内容。临时GPU服务在验收成功或失败后都必须下线；GPU消耗单独授权的启智卡时。
 

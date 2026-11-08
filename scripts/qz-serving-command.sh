@@ -2,6 +2,7 @@
 set -euo pipefail
 
 # 作为启智运行命令的内容提交；不要求服务容器挂载代码仓库。
+export PORT="${PORT:-8000}"
 export VLLM_ENGINE_READY_TIMEOUT_S=3600
 export VLLM_USE_RUST_FRONTEND=0
 python3 - <<'PY'

@@ -93,7 +93,7 @@ The command pins the remote revision, verifies each shard, concatenates its orig
 
 ## Model interface
 
-The designated service is DeepSeek-V4.1-Flash-1017 deployed with vLLM on the Qizhi platform. The supplied command is [`scripts/qz-serving-command.sh`](scripts/qz-serving-command.sh); its model path is explicit and independent of the platform's model selector.
+The designated service is DeepSeek-V4.1-Flash-1017 deployed with vLLM on the Qizhi platform. Submit the contents of [`scripts/qz-serving-command.sh`](scripts/qz-serving-command.sh) through a non-login `bash -c` command to preserve the image environment; the container does not need this repository mounted. The model path is explicit and independent of the platform's model selector.
 
 The manual `LLM interface probe` workflow reads `LLM_BASE_URL` and `LLM_API_KEY` from GitHub Secrets. It checks model identity, plain output, JSON Schema output, and thinking-mode final content. The temporary GPU service must be taken offline after the probe, including failure paths. GPU time uses the separately authorized Qizhi allocation.
 
