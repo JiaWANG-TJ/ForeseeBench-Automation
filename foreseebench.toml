@@ -1,0 +1,36 @@
+[protocol]
+collection_start_offset_hours = 17
+freeze_offset_hours = 35
+publish_offset_hours = 41
+submission_hours = 72
+ending_window_days = 5
+finalization_hours = 24
+domain_event_cap = 200
+sampling_seed = 20261105
+
+[stages]
+v2_validator = ""
+v4_validator = ""
+
+[storage]
+root = "data"
+row_group_rows = 65536
+row_group_bytes = 67108864
+shard_bytes = 536870912
+memory_limit = "1GB"
+
+[network]
+timeout_seconds = 60
+attempts = 5
+requests_per_second = 5
+workers = 8
+gamma_url = "https://gamma-api.polymarket.com"
+data_url = "https://data-api.polymarket.com"
+
+[publication]
+repo_id = "SII-JiaWANG/ForeseeBench"
+revision = "main"
+
+[scheduler]
+poll_seconds = 300
+publish = true

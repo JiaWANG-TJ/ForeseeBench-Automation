@@ -1,0 +1,50 @@
+[build-system]
+requires = ["hatchling==1.28.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "foreseebench"
+version = "0.1.0"
+description = "Reproducible Polymarket source data for dynamic forecasting benchmarks"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "httpx==0.28.1",
+  "ijson==3.4.0.post0",
+  "simplejson==3.20.2",
+  "pyarrow==26.0.1",
+  "numpy==2.3.4",
+  "duckdb==2.0.0",
+  "huggingface-hub==2.4.0",
+  "hf-xet==1.8.0",
+  "apscheduler==3.11.3",
+  "jsonschema==4.26.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest==8.4.2",
+    "ruff==0.14.3",
+    "mypy==1.18.2",
+    "types-simplejson==3.20.0.20250822",
+    "datasets==5.1.0",
+]
+
+[project.scripts]
+foreseebench = "foreseebench.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/foreseebench"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.mypy]
+python_version = "3.12"
+check_untyped_defs = true
+ignore_missing_imports = true
