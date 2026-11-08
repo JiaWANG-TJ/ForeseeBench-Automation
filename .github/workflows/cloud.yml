@@ -1,0 +1,119 @@
+name: ForeseeBench cloud runner
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: '隔离工程核验，或推进正式管线'
+        type: choice
+        options: [qualification, production]
+        default: qualification
+      work_seconds:
+        description: '工程核验工作预算；正式运行固定 2700 秒'
+        type: string
+        default: '120'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: foreseebench-production
+  cancel-in-progress: false
+
+jobs:
+  run-once:
+    if: >-
+      vars.FORESEEBENCH_ENABLED == 'true' ||
+      (github.event_name == 'workflow_dispatch' && inputs.mode == 'qualification')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    outputs:
+      status: ${{ steps.status.outputs.status }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: '0.13.7'
+          python-version: '3.12.7'
+          enable-cache: true
+      - name: Install frozen dependencies
+        run: uv sync --frozen --no-dev
+      - name: Restore, run once, and checkpoint
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_BUCKET: SII-JiaWANG/ForeseeBench-state
+          HF_REPO_ID: SII-JiaWANG/ForeseeBench
+          HF_HOME: ${{ runner.temp }}/huggingface
+          HF_HUB_DISABLE_PROGRESS_BARS: '1'
+          PYTHONUNBUFFERED: '1'
+          RUN_MODE: ${{ inputs.mode || 'production' }}
+          WORK_SECONDS: ${{ inputs.work_seconds || '120' }}
+        run: |
+          if [[ "$RUN_MODE" == "qualification" ]]; then
+            uv run --no-sync python -m foreseebench.cloud \
+              --config foreseebench.toml --bucket "$HF_BUCKET" \
+              --qualification --namespace "qualification/actions-${GITHUB_RUN_ID}" \
+              --work-seconds "$WORK_SECONDS" --checkpoint-seconds 600
+          else
+            uv run --no-sync python -m foreseebench.cloud \
+              --config foreseebench.toml --bucket "$HF_BUCKET" \
+              --bootstrap --work-seconds 2700 --checkpoint-seconds 600 \
+              --status-output "$RUNNER_TEMP/foreseebench-status.json"
+          fi
+      - name: Expose aggregate status
+        id: status
+        if: always()
+        run: |
+          if [[ -f "$RUNNER_TEMP/foreseebench-status.json" ]]; then
+            printf 'status=%s\n' "$(cat "$RUNNER_TEMP/foreseebench-status.json")" >> "$GITHUB_OUTPUT"
+          fi
+
+  maintain-status:
+    needs: run-once
+    if: always() && needs.run-once.outputs.status != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Prepare daily or phase-change status
+        env:
+          SUMMARY_JSON: ${{ needs.run-once.outputs.status }}
+        run: |
+          python - <<'PY'
+          import base64
+          import json
+          import os
+          import pathlib
+          import subprocess
+
+          summary = json.loads(os.environ['SUMMARY_JSON'])
+          path = pathlib.Path('automation/status.json')
+          previous = json.loads(path.read_text()) if path.exists() else {}
+          if (previous.get('date'), previous.get('phases')) == (summary['date'], summary['phases']):
+              raise SystemExit(0)
+          content = (json.dumps(summary, ensure_ascii=False, sort_keys=True, indent=2) + '\n').encode()
+          payload = {
+              'message': 'chore: update automation status ' + summary['date'],
+              'content': base64.b64encode(content).decode(),
+              'branch': os.environ['GITHUB_REF_NAME'],
+          }
+          if path.exists():
+              payload['sha'] = subprocess.check_output(['git', 'hash-object', str(path)], text=True).strip()
+          (pathlib.Path(os.environ['RUNNER_TEMP']) / 'status-commit.json').write_text(json.dumps(payload))
+          PY
+      - name: Commit aggregate status
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ -f "$RUNNER_TEMP/status-commit.json" ]]; then
+            gh api --method PUT "repos/$GITHUB_REPOSITORY/contents/automation/status.json" \
+              --input "$RUNNER_TEMP/status-commit.json" > /dev/null
+          fi

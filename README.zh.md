@@ -2,91 +2,103 @@
 
 **简体中文** | [English](README.md)
 
-ForeseeBench采集完整Polymarket Event、Markets、评论、逐笔成交和官方结算证据，同时向HF提供**完整集**与**分域采样集**。
+ForeseeBench从Polymarket构建可复现的预测题源数据，采集完整Event及Markets、评论、逐笔成交和官方结算证据，并向HF发布完整视图与分域采样视图。
 
-[数据集](https://huggingface.co/datasets/SII-JiaWANG/ForeseeBench) · [执行协议](docs/protocol.md) · [字段契约](docs/data_contract.md) · [验收记录](docs/acceptance.md)
+[数据集](https://huggingface.co/datasets/SII-JiaWANG/ForeseeBench) · [自动化运行](https://github.com/JiaWANG-TJ/ForeseeBench-Automation/actions) · [字段契约](docs/data_contract.md) · [执行协议](docs/protocol.md)
 
-## 流程
+## 已实现能力
 
-**归档公开来源 → 筛选完整Event → 冻结V1与采样名单 → V3回收原生GT → 同时发布两个数据范围**
+- 先归档公开v1/v2来源，再按全部Market的计划结束日期和原生未决状态筛选完整Event。
+- 完整保存全部合规题源。`balanced`每主领域最多200个Event，使用固定种子在系列与结束日期之间轮询；稀缺领域全部保留，不补满总量。
+- 回收结果前冻结成员名单。保留全部Market、缺失值、失败记录、评论关系与成交重数。
+- 联合官方生命周期和token接口整理原生结算。行情不作为GT，支付是否齐全与预测时间资格分别记录。
+- 以增量JSONL分片和规范Parquet快照发布四种视图。
 
-- 先按记录的Event ID边界归档v1/v2、全部公开状态，并补查列表遗漏的详情，再筛选。
-- `full`保存全部合规Event及其全部冻结Markets。后续的未决、失败、迟到和冲突结果保留。
-- `balanced`每个主领域最多200个Event；域内轮询系列与UTC结束日期。稀缺域全部保留，不把剩余名额补给体育等大域。
-- 名单在回收结果前冻结；后来失效或GT不全的Event仍保留在原名单中。
-- 题量与领域分布只作统计，不再以500、1000或整批全部有效作为数据保存和发布条件。
+LLM构题、题目审核、构造题GT和答案判分仍是后续处理器。当前提供统一模型客户端与接口探测；接口测试成功不等于这些业务已实现或已取得评测成绩。
 
-原始管线不调用LLM。V2构题与V4构造题GT保持未配置接口；原生Market结果不再自动拼成一个Event级QA答案。
+## 自动化为什么能运行
 
-## 时间与配置
+```text
+GitHub托管CPU任务 -> Polymarket API
+                 -> HF私有Bucket：可恢复工作状态
+                 -> HF Dataset：验收通过的输入与结果快照
+```
 
-| 环节 | 默认UTC安排 |
+公开运行仓库使用GitHub标准Ubuntu runner，无需本地Notebook一直在线。GitHub每五分钟触发工作流，程序检查当前哪些批次阶段到期；同一生产并发组只允许一个写入任务。
+
+每次最多处理45分钟，预留10分钟上传检查点，任务硬超时60分钟。长采集跨多次任务续跑。数据库在runner本地盘执行事务，关闭后显式上传并核验快照；恢复只接受完整代次，工作检查点保留最近两代。
+
+GitHub定时触发可能延迟或漏跑，程序依据批次状态及真实UTC时刻恢复。错过截止不能伪造时间或发布未完整数据。Actions页面展示实际执行，`automation/status.json`按日或阶段变化记录汇总状态。HF Dataset负责保存和分发数据，不负责执行这个工作流。
+
+按GitHub当前规则，公开仓库标准runner免费；HF存储受账户额度约束。本部署不启用付费计算或存储升级，用量未知或空间余量不足时停止新增写入并报告。参见[GitHub限制](https://docs.github.com/en/actions/reference/limits)与[HF存储额度](https://huggingface.co/docs/hub/storage-limits)。
+
+## 每周时间安排
+
+全部使用UTC，参数集中在[`foreseebench.toml`](foreseebench.toml)。
+
+| 环节 | 安排 |
 | --- | --- |
-| 准备 | 周一17:00—周二17:00 |
-| 冻结V1 | 周二11:00 |
+| 来源准备 | 周一17:00开始 |
+| V1特征截止与冻结 | 周二11:00 |
 | 计划发题 | 周二17:00，仍需真实V2处理器 |
 | 用户作答 | 实际发题后72小时 |
 | GT回收 | 随后120小时，全批统一截止 |
-| 后处理 | 24小时 |
+| 后处理 | GT截止后24小时 |
 
-名义周期十天。每个冻结Market都须满足`提交截止 < endDate <= GT截止`；开始时间只作可选信息。计划结束日期不能证明真实结算，支付事实和时间资格分别记录。
+每个冻结Market都必须满足`提交截止 < endDate <= GT截止`；开始时间只作元数据。名义日程跨十天，不再另设十二天总周期上限。每周继续启动新批次，批次可重叠。
 
-统一配置为[`foreseebench.toml`](foreseebench.toml)：`domain_event_cap=200`、固定种子`20261105`、8个网络worker、共享每秒5次请求、300秒调度间隔。
+初始`bootstrap`使用真实启动时刻，允许18小时完成采集，并记录实际冻结时间。截止仍未完成的批次明确保留为未完成。V2/V4未配置时，计划发题时间不表示已经发布正式问题。
 
-## 运行
+## 部署配置
 
-环境为Python 3.12与[uv](https://docs.astral.sh/uv/)。配置有写入权限的HF仓库；只在本地运行时设置`scheduler.publish=false`。认证沿用宿主HF凭据或`HF_TOKEN`。
+1. 使用公开源码仓库、有写入权限的HF Dataset和私有HF Bucket。
+2. 在`foreseebench.toml`设置Dataset，并在`.github/workflows/cloud.yml`设置Bucket及Dataset标识。
+3. 将授权的`HF_TOKEN`配置为GitHub Actions Secret，不提交凭据或工作数据。
+4. 手动运行`qualification`模式，再重跑同一次工作流执行，验证从新的runner恢复检查点。
+5. 将仓库变量`FORESEEBENCH_ENABLED`设为`true`启用生产；设为`false`暂停后续定时运行。
+
+首次没有批次时，工作流以`--bootstrap`启动，随后遵循每周日程。工程核验使用独立Bucket前缀，不发布正式数据。
+
+本地开发使用Python 3.12与[uv](https://docs.astral.sh/uv/)：
 
 ```bash
 uv sync --locked
-uv run foreseebench --help
-uv run foreseebench run
-```
-
-每个数据目录只运行一个写入进程。`formal`遵循周批窗口；`bootstrap`记录真实采集、冻结时间；`qualification`隔离工程核验。历史协议只读，不再启动旧周期采集或回收。
-
-导出已存在的批次，`--week`接受周一日期或实际bootstrap批次ID：
-
-```bash
-uv run foreseebench export --week 2026-11-09 --view full --output data/full-basic.jsonl
-uv run foreseebench export --week 2026-11-09 --view balanced --stage latest --extended --output data/balanced-extended.jsonl
-```
-
-默认读取V1，不含原生GT；`--stage latest`读取最新不可变结果快照。
-
-## 读取数据
-
-HF的`basic`和`extended`配置均提供`full`、`balanced`两个split。使用`datasets==5.1.0`或兼容的新版本；数据卡采用官方JSON字段类型，嵌套内容自动解码为Python列表和字典。
-
-```python
-from datasets import load_dataset
-
-data = load_dataset("SII-JiaWANG/ForeseeBench", "basic", split="balanced", streaming=True)
-for event in data.take(1):
-    print(event["source_id"], event["title"])
-    print(event["native_gt"])
-```
-
-零条视图仍保存为空文件。流式读取正常返回空迭代；`datasets==5.1.0`默认物化空split会报错。非空视图可省略`streaming=True`，使用下标及`len(data)`。
-
-下载文件为`full/basic.jsonl`、`full/extended.jsonl`、`balanced/basic.jsonl`、`balanced/extended.jsonl`及`statistics.json`。统计包含全部主领域与未分类项、已知来源和筛选分母、两个数据范围的数量与原生GT状态；历史未知计数保持null。
-
-原始Event使用`source_id`；`qa_id`仅用于真正构造的题目。`markets`保存一次完整结构，`native_gt`逐Market保存对齐的支付和状态。扩展版另含完整规则描述、评论关系与成交；详细HTTP回执留在关联审计归档中。[字段说明](docs/data_contract.md)
-
-累计视图每个Event选择一份完整快照：正式题集绑定优先，否则取最新冻结快照；采样视图使用同一快照的子集。每批名单、全部Parquet输入与历史归档仍保留。新数据物理格式及JSONL为3.0；旧文件保留原schema和时间协议，历史格式投影标记为`historical_projection`。
-
-## 预留的题目接口
-
-未来V2可将元数据重构为选择、数值、排序或开放文本题，V4接收构造题与真实原生GT。本轮不运行这两个LLM处理器或语义判分器。
-
-用户预测只包含`answer`和`confidence`，置信度须为有限的0—1数值。未来判分器依据参考答案产生`correct=0/1`后，置信度Brier loss为`(confidence-correct)²`。不需要另一个PM或LLM生成的`gt_confidence`；行情报价不作为结算标签。
-
-## 开发验证
-
-```bash
+uv run python -m foreseebench.cloud --help
 uv run pytest
 uv run ruff check src tests scripts
 uv run mypy src
 ```
 
-详见[执行协议](docs/protocol.md)、[验收记录](docs/acceptance.md)及[历史来源与时间窗审计](docs/polymarket_timing_audit.md)。历史审计中的数量目标只保留分析意义。
+## 读取与下载
+
+使用`datasets==5.1.0`或兼容版本。`basic`和`extended`配置各提供`full`、`balanced` split；私有数据集需要授权HF凭据。
+
+```python
+from datasets import load_dataset
+
+rows = load_dataset("SII-JiaWANG/ForeseeBench", "basic", split="balanced", streaming=True)
+for event in rows.take(1):
+    print(event["source_id"], event["title"], event["native_gt"])
+```
+
+嵌套字段自动解码为字典、列表或None；空视图也可流式读取。非空视图支持普通下标读取。`manifest.json`列出当前分片，`statistics.json`提供完整分母、领域数量、采样名单及GT状态；复现时固定HF的`revision`。
+
+无需本地管线数据库，也可把一个累计视图下载为完整JSONL：
+
+```bash
+uv run foreseebench download-view --repo SII-JiaWANG/ForeseeBench   --format extended --view full --output full-extended.jsonl
+```
+
+命令固定远端提交、逐片核验并串联原始字节，最后原子写入通过校验的文件，保留十进制文本。原始Event使用`source_id`，`qa_id`只用于未来真正构造的题目。详见[字段定义](docs/data_contract.md)。
+
+## 模型接口
+
+指定模型为启智平台vLLM部署的DeepSeek-V4.1-Flash-1017。运行命令见[`scripts/qz-serving-command.sh`](scripts/qz-serving-command.sh)，真正权重由显式路径确定，不由平台占位模型选择项决定。
+
+手动`LLM interface probe`工作流从GitHub Secrets读取`LLM_BASE_URL`、`LLM_API_KEY`，检查模型身份、普通回答、JSON Schema输出及思考模式最终内容。临时GPU服务在验收成功或失败后都必须下线；GPU消耗单独授权的启智卡时。
+
+客户端也可通过`python -m foreseebench.llm`调用。具体QA与语义判分仍未启用。用户预测只需`answer`与`confidence`；未来置信度Brier使用答案正确性的0/1标签，不编造GT置信度。
+
+## 验证与维护
+
+[验收记录](docs/acceptance.md)分别报告软件检查、远端执行、数据完整性和模型接口就绪。永久保留规范输入、结果及必要证据；及时清理验证完毕的临时下载和失效工作检查点。正式批次期间更新代码或配置，必须遵守已冻结的实现身份约束。

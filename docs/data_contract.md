@@ -4,15 +4,17 @@
 
 ## 文件与分母
 
-| 文件 | 内容 |
+| 读取视图／文件 | 内容 |
 | --- | --- |
-| `full/basic.jsonl` | 完整来源视图，包含全部合规Event的基础结构与原生GT |
-| `full/extended.jsonl` | 同一Event集合，增加完整规则、评论关系与成交 |
-| `balanced/basic.jsonl` | 同一冻结输入中每域最多200个Event的采样视图 |
-| `balanced/extended.jsonl` | 同一采样集合的完整上下文 |
+| basic / full | 完整来源视图，包含全部合规Event的基础结构与原生GT |
+| extended / full | 同一Event集合，增加完整规则、评论关系与成交 |
+| basic / balanced | 同一冻结输入中每域最多200个Event的采样视图 |
+| extended / balanced | 同一采样集合的完整上下文 |
 | `statistics.json` | 每批完整分母、各域各阶段数量、采样名单与GT状态 |
 
-累计文件每Event选择一个完整快照，规则是正式题集绑定优先，否则取最新冻结快照。采样文件是相同快照的子集；历史各周全部输入及名单仍留在Parquet、manifest和归档中。统计同时列出每批数量与累计去重数量，不把两种分母混用。
+物理路径为`<full|balanced>/<basic|extended>/<partition>/<content-hash>.jsonl`，精确文件列表来自同一提交的`manifest.json`中`exports`。按source_id的SHA-256首hex划分16个稳定分区，每片目标128MiB；超大Event独占分片且保留完整内容。读取仍使用`load_dataset(repo, "basic", split="full")`等四种组合。
+
+累计视图每Event选择一个完整快照，规则是正式题集绑定优先，否则取最新冻结快照。采样是相同快照的子集；新周期各周全部规范输入及名单继续留在Parquet、manifest和归档中。统计分别列出每批数量与累计去重数量。`foreseebench download-view`固定远端commit，逐片校验后原样串联合成一个累计JSONL，错误不会覆盖已有输出。
 
 `selection_origin=frozen_v1`表示名单已经在V1冻结；`historical_projection`表示从旧冻结来源按当前规则生成的读取投影。后者不改变旧时间协议，也不追认历史预测成绩。未知的历史来源／筛选计数保持null。
 
@@ -68,7 +70,7 @@
 HF的`basic`、`extended`配置各有full／balanced两个split。复杂列声明为官方Json特性，`datasets==5.1.0`加载后仍是Python字典、列表或None；无需对单元格再次json.loads。原始JSONL直接下载也保持原嵌套结构。
 零条视图保存真实空文件和零计数，不造占位行。该客户端默认物化空split会报错，使用`load_dataset(..., streaming=True)`可正常取得空迭代；非空数据同时支持物化和流式读取。
 
-四类规范Parquet表为events、comments、trades、resolutions；新schema为3.0，历史不兼容schema使用独立legacy配置。原件、每次请求回执、配置及算法版本位于关联manifest和审计文件中。
+四类规范Parquet表为events、comments、trades、resolutions，schema与JSONL行结构仍为3.0，分片布局由清单描述。V1的`source-metadata.json`是绑定原归档的轻量摘要，既有哈希及完整原件仍可追溯。历史不兼容schema保留只读兼容；本次明确退役的旧数据不混入新发布。
 
 源数据不再输出伪QA ID、Event级便捷答案或重复的详细取证树。`qa_id`和构造题的`groundtruth`只出现在未来V2/V4产物中。
 

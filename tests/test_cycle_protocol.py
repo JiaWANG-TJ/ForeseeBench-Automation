@@ -3,7 +3,7 @@ from datetime import timedelta
 import pytest
 from test_contract import raw_event
 
-from foreseebench.contract import Week, admit_event, instant, settle_event
+from foreseebench.contract import Policy, Week, admit_event, instant, settle_event
 from foreseebench.pipeline import Pipeline
 from foreseebench.store import Store, atomic_json, read_manifest
 
@@ -22,7 +22,25 @@ def test_weekly_cycle_reserves_three_days_to_answer_and_five_days_for_gt():
     assert week.finalize_at - week.collection_start == timedelta(days=10)
     assert record["gt_deadline_at"] == "2026-11-18T17:00:00.000000Z"
     assert record["policy"]["domain_event_cap"] == 200
+    assert record["policy"]["submission_hours"] == 72
+    assert record["policy"]["ending_window_days"] == 5
     assert not {"target_events", "minimum_events"} & record["policy"].keys()
+    assert Week.restore(record).record() == record
+
+
+@pytest.mark.parametrize(
+    ("finalization_hours", "finalize_at"),
+    [(72, "2026-11-21T17:00:00.000000Z"), (96, "2026-11-22T17:00:00.000000Z")],
+)
+def test_policy_and_week_record_allow_a_valid_cycle_of_twelve_days_or_more(finalization_hours, finalize_at):
+    policy = Policy(finalization_hours=finalization_hours)
+    assert Policy.load(policy.record()) == policy
+    week = Week.parse("2026-11-09", policy)
+    record = week.record()
+    assert record["finalize_at"] == finalize_at
+    assert record["freeze_at"] == "2026-11-10T11:00:00.000000Z"
+    assert record["submission_deadline"] == "2026-11-13T17:00:00.000000Z"
+    assert record["gt_deadline_at"] == "2026-11-18T17:00:00.000000Z"
     assert Week.restore(record).record() == record
 
 

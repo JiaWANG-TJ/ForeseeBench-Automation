@@ -246,7 +246,6 @@ def release_benchmark(
     if scheduled.policy.read_only:
         raise ValueError("legacy_batch_read_only")
     week = replace(scheduled, publication_at=instant(clock()), collection_cutoff=instant(base["frozen_at"]))
-    week.require_cycle_budget()
     if week.publish_at < instant(base["frozen_at"]):
         raise ValueError("publication_before_freeze")
     if base["kind"] == "formal" and week.publish_at < scheduled.publish_at:
@@ -325,7 +324,6 @@ def release_benchmark(
         )
     # 所有网络工作及大文件核验完成后确定服务端发布时刻，完整保留 72 小时。
     week = replace(week, publication_at=instant(clock()))
-    week.require_cycle_budget()
     eligible = []
     for source in accepted:
         review = records[source["event_id"]]["review"]

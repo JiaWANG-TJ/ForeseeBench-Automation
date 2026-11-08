@@ -2,91 +2,103 @@
 
 [简体中文](README.zh.md) | **English**
 
-ForeseeBench collects complete Polymarket Events, Markets, comments, individual trades, and official settlement evidence. It preserves every qualified source Event and publishes both a **full dataset** and a **domain-capped dataset** to Hugging Face.
+ForeseeBench builds reproducible forecasting source data from Polymarket. It collects complete Events and Markets, comments, individual trades, and official settlement evidence, then publishes a full view and a domain-capped view to Hugging Face.
 
-[Dataset](https://huggingface.co/datasets/SII-JiaWANG/ForeseeBench) · [Execution protocol](docs/protocol.md) · [Data contract](docs/data_contract.md) · [Verification](docs/acceptance.md)
+[Dataset](https://huggingface.co/datasets/SII-JiaWANG/ForeseeBench) · [Automation](https://github.com/JiaWANG-TJ/ForeseeBench-Automation/actions) · [Data contract](docs/data_contract.md) · [Execution protocol](docs/protocol.md)
 
-## Workflow
+## What is implemented
 
-**Archive public sources → Screen complete Events → Freeze V1 and sampling membership → Collect native GT in V3 → Publish both views**
+- Archive public v1/v2 sources before screening complete Events by their Market end dates and unresolved state.
+- Preserve every eligible source Event. `balanced` selects at most 200 Events per primary domain, with fixed-seed rotation across series and end dates. Scarce domains remain complete; no global population target is filled.
+- Freeze source membership before collecting results. Preserve every Market, missing value, failure, comment relationship, and trade multiplicity.
+- Update native settlement evidence from official lifecycle and token responses. Prices are not ground truth; payout completeness and forecasting-time eligibility are separate.
+- Publish both views as incremental JSONL shards and canonical Parquet snapshots.
 
-- Discovery covers explicit v1/v2 and all public states within a recorded Event ID boundary, including detail-only Events. Filtering follows source acquisition.
-- `full` retains every qualified Event and all its frozen Markets. Missing results, failures, and historical snapshots are preserved.
-- `balanced` selects at most **200 Events per primary domain**, rotating through series and UTC end dates. Scarce domains are kept in full; other domains do not fill unused places. Original tags remain unchanged.
-- Membership is frozen before result collection. A later invalid or incomplete result does not remove a source from either view.
-- Population size and domain distribution are statistics. There is no minimum of 500, global target of 1,000, or whole-batch success gate.
+LLM question construction, question review, constructed-question GT, and answer grading are future processors. The shared model client and its interface probe are available; a successful probe does not establish those processors or benchmark scores.
 
-The raw pipeline does not call an LLM. V2 question construction and V4 construction of those questions' answers remain unconfigured interfaces. Native Market results are not collapsed into an Event-level QA answer.
+## How automation runs
 
-## Time and configuration
+```text
+GitHub-hosted CPU runner -> Polymarket APIs
+                        -> private HF Bucket: resumable working state
+                        -> HF Dataset: verified source and result snapshots
+```
 
-| Stage | Default UTC schedule |
+The public automation repository uses standard GitHub-hosted Ubuntu runners. It does not require a local notebook to remain online. GitHub starts a workflow every five minutes; each run checks which batch stages are due. One production concurrency group prevents simultaneous writers.
+
+Each run has 45 minutes of work, a 10-minute checkpoint allowance, and a 60-minute job limit. Long collection resumes across runs. Database transactions use local runner storage; closed, verified snapshots are uploaded explicitly to the private Bucket. Only complete generations can be restored, and the latest two working generations are retained.
+
+GitHub schedules can be delayed or missed. Batch state and actual UTC time determine recovery; missing a deadline never permits fabricated timestamps or incomplete publication. The Actions page shows executions, and `automation/status.json` records daily or phase-change aggregate status. HF Dataset stores and distributes data; it does not execute this workflow.
+
+Public standard runners are free under GitHub's current rules. HF storage is bounded by the account's allowance; the default deployment does not enable paid compute or storage upgrades. Unknown or insufficient storage headroom stops new writes and is reported. See [GitHub limits](https://docs.github.com/en/actions/reference/limits) and [HF storage plans](https://huggingface.co/docs/hub/storage-limits).
+
+## Weekly timing
+
+All times are UTC. The schedule is configured in [`foreseebench.toml`](foreseebench.toml).
+
+| Stage | Schedule |
 | --- | --- |
-| Preparation | Monday 17:00 to Tuesday 17:00 |
-| Freeze V1 | Tuesday 11:00 |
+| Source preparation | Monday 17:00 onward |
+| V1 feature cutoff and freeze | Tuesday 11:00 |
 | Planned question publication | Tuesday 17:00; requires a real V2 processor |
-| Answer window | 72 hours after actual publication |
-| GT collection | The following 120 hours, with one batch deadline |
-| Postprocessing | 24 hours |
+| Answers | 72 hours after actual publication |
+| GT collection | Following 120 hours, with one batch deadline |
+| Postprocessing | 24 hours after the GT deadline |
 
-The nominal cycle is ten days. Every frozen Market must satisfy `submission_deadline < endDate <= gt_deadline`. Start dates are optional metadata. Scheduled end dates do not prove actual settlement; payouts and forecasting-time eligibility are recorded separately.
+Every frozen Market must satisfy `submission_deadline < endDate <= gt_deadline`. Start dates are optional metadata. The nominal schedule spans ten days; there is no additional twelve-day cap. Weekly batches may overlap.
 
-[`foreseebench.toml`](foreseebench.toml) is the unified configuration: `domain_event_cap=200`, `sampling_seed=20261105`, eight network workers, five requests per second, and a 300-second scheduler interval.
+An initial `bootstrap` starts at its real creation time, allows 18 hours for complete collection, and records its actual freeze time. An incomplete batch at its deadline remains explicitly incomplete. V2/V4 remain unconfigured, so a planned publication time is not a claim that questions have been released.
 
-## Run
+## Set up a deployment
 
-Use Python 3.12 and [uv](https://docs.astral.sh/uv/). Configure an existing HF dataset repository you can write to, or set `scheduler.publish=false` for local operation. Authentication uses the host's HF credentials or `HF_TOKEN`.
+1. Use this public source repository and a writable HF Dataset plus a private HF Bucket.
+2. Set the Dataset in `foreseebench.toml` and the Bucket/Dataset identifiers in `.github/workflows/cloud.yml`.
+3. Add the authorized `HF_TOKEN` as a GitHub Actions secret. Never commit credentials or working data.
+4. Run the workflow manually in `qualification` mode. Re-run the same workflow execution to verify recovery from a fresh runner.
+5. Set the repository variable `FORESEEBENCH_ENABLED=true` to enable production. Set it to `false` to pause subsequent scheduled runs.
+
+The workflow supplies `--bootstrap` when no batch exists, then follows the weekly schedule. Qualification uses an isolated Bucket prefix and never publishes production data.
+
+For development with Python 3.12 and [uv](https://docs.astral.sh/uv/):
 
 ```bash
 uv sync --locked
-uv run foreseebench --help
-uv run foreseebench run
-```
-
-Run one writer per data directory. `formal` follows the weekly window; `bootstrap` records actual collection and freeze times; `qualification` isolates engineering validation. Historical protocols remain readable but cannot start new collection or GT updates.
-
-Export an existing batch using its Monday date or recorded bootstrap ID:
-
-```bash
-uv run foreseebench export --week 2026-11-09 --view full --output data/full-basic.jsonl
-uv run foreseebench export --week 2026-11-09 --view balanced --stage latest --extended --output data/balanced-extended.jsonl
-```
-
-The default stage is V1, with no native GT. `--stage latest` reads the latest immutable result snapshot.
-
-## Data access
-
-The `basic` and `extended` HF configurations each expose `full` and `balanced` splits. Use `datasets==5.1.0` or a compatible newer version. The dataset card declares the official JSON feature for nested fields, which decode to Python lists and dictionaries.
-
-```python
-from datasets import load_dataset
-
-data = load_dataset("SII-JiaWANG/ForeseeBench", "basic", split="balanced", streaming=True)
-for event in data.take(1):
-    print(event["source_id"], event["title"])
-    print(event["native_gt"])
-```
-
-Zero-row views remain empty files. Streaming safely yields no rows; `datasets==5.1.0` raises an error when materializing an empty split. For nonempty views, omit `streaming=True` to use indexed access and `len(data)`.
-
-Downloadable files are `full/basic.jsonl`, `full/extended.jsonl`, `balanced/basic.jsonl`, `balanced/extended.jsonl`, and `statistics.json`. Statistics show every primary domain, unclassified records, known source/screening counts, both view sizes, and native GT states. Historical unknown counts remain null.
-
-Source Events use `source_id`; `qa_id` is reserved for constructed questions. `markets` contains the complete structure once. `native_gt` retains aligned Market payouts and statuses. Extended records include complete rule descriptions, comments/replies, and trades. Detailed HTTP receipts remain in associated audit archives. See the [field definitions](docs/data_contract.md).
-
-Cumulative views select one whole snapshot per Event: a formal release binding takes priority, otherwise the latest frozen snapshot is used. The balanced view uses a subset of those same snapshots. Per-batch memberships and all original Parquet inputs remain available. New physical data and JSONL schemas are version 3.0; historical files retain their original schema and timing protocol. Historical format projections are marked `historical_projection`.
-
-## Future question interfaces
-
-V2 may reconstruct sources into choice, numeric, ranking, or open-text questions. V4 will receive those questions and actual native GT. This release implements neither LLM processor nor semantic answer grading.
-
-A prediction contains only `answer` and `confidence`, with finite confidence in `[0,1]`. Once a future grader determines correctness, confidence Brier loss is `(confidence - correct)²`, where `correct` is 0 or 1. No separate PM or LLM-generated `gt_confidence` is required. Market quotes are not settlement labels.
-
-## Development
-
-```bash
+uv run python -m foreseebench.cloud --help
 uv run pytest
 uv run ruff check src tests scripts
 uv run mypy src
 ```
 
-See the [execution protocol](docs/protocol.md), [acceptance records](docs/acceptance.md), and [historical source/timing audit](docs/polymarket_timing_audit.md). Historical population targets are analysis context, not current publication conditions.
+## Read or download data
+
+Install `datasets==5.1.0` or a compatible version. The `basic` and `extended` configurations each expose `full` and `balanced` splits. Private repositories require authorized HF credentials.
+
+```python
+from datasets import load_dataset
+
+rows = load_dataset("SII-JiaWANG/ForeseeBench", "basic", split="balanced", streaming=True)
+for event in rows.take(1):
+    print(event["source_id"], event["title"], event["native_gt"])
+```
+
+Nested fields decode to dictionaries, lists, or `None`. Streaming also handles empty views. Nonempty views support normal indexed loading. `manifest.json` lists the current shards; `statistics.json` reports full denominators, domain counts, selection membership, and GT states. Pin an HF `revision` for reproducible reads.
+
+Download a verified cumulative view as one JSONL without a local pipeline database:
+
+```bash
+uv run foreseebench download-view --repo SII-JiaWANG/ForeseeBench   --format extended --view full --output full-extended.jsonl
+```
+
+The command pins the remote revision, verifies each shard, concatenates its original bytes, and atomically writes the validated output. It preserves decimal text. Source Events use `source_id`; `qa_id` belongs to future constructed questions. See the [field definitions](docs/data_contract.md).
+
+## Model interface
+
+The designated service is DeepSeek-V4.1-Flash-1017 deployed with vLLM on the Qizhi platform. The supplied command is [`scripts/qz-serving-command.sh`](scripts/qz-serving-command.sh); its model path is explicit and independent of the platform's model selector.
+
+The manual `LLM interface probe` workflow reads `LLM_BASE_URL` and `LLM_API_KEY` from GitHub Secrets. It checks model identity, plain output, JSON Schema output, and thinking-mode final content. The temporary GPU service must be taken offline after the probe, including failure paths. GPU time uses the separately authorized Qizhi allocation.
+
+The client is also callable as `python -m foreseebench.llm`. Actual QA generation and semantic scoring remain disabled. Predictions require only `answer` and `confidence`; future confidence Brier loss uses the answer's 0/1 correctness label, not an invented GT confidence.
+
+## Verification and maintenance
+
+The [acceptance record](docs/acceptance.md) distinguishes software checks, remote execution, data completeness, and model-interface readiness. Keep permanent source/results and necessary evidence; discard verified temporary downloads and superseded working checkpoints. Code and configuration changes during an active formal batch must respect its frozen implementation identity.

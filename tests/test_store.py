@@ -6,6 +6,29 @@ from foreseebench.contract import Week, admit_event
 from foreseebench.store import Store, read_records
 
 
+def test_missing_immutable_evidence_requires_verified_remote_proof_and_local_files_still_match(tmp_path):
+    import pytest
+
+    from foreseebench.store import SCHEMAS, file_hash
+
+    path = tmp_path / "evidence.sqlite"
+    path.write_bytes(b"frozen evidence")
+    entry = {"table": "evidence", "path": path.name, "sha256": file_hash(path), "rows": 0}
+    manifest = {"files": [entry], "counts": {table: 0 for table in SCHEMAS}}
+    path.unlink()
+    with Store(tmp_path, immutable_verifier=lambda value: value == entry) as store:
+        assert store.verify(manifest)["valid"] is True
+        path.write_bytes(b"corrupted local evidence")
+        with pytest.raises(ValueError, match="checksum_mismatch"):
+            store.verify(manifest)
+        path.unlink()
+        with pytest.raises(ValueError, match="manifest_path_invalid"):
+            store.verify(dict(manifest, files=[dict(entry, table="events")]))
+    with Store(tmp_path, immutable_verifier=lambda value: False) as store:
+        with pytest.raises(ValueError, match="manifest_path_invalid"):
+            store.verify(manifest)
+
+
 def test_page_retry_preserves_fill_multiplicity_and_frozen_hashes(tmp_path):
     week = Week.parse("2026-11-02")
     source = admit_event(raw_event(), week, week.open_at)
@@ -33,6 +56,28 @@ def test_page_retry_preserves_fill_multiplicity_and_frozen_hashes(tmp_path):
         assert manifest["counts"]["trades"] == 2
         assert len(list(read_records(tmp_path, manifest, "trades"))) == 2
         assert store.freeze(week, week.freeze_at) == manifest
+
+
+def test_immutable_file_resolution_hydrates_and_rejects_wrong_bytes(tmp_path):
+    import pytest
+
+    from foreseebench.store import file_hash
+
+    target = tmp_path / "evidence.sqlite"
+    target.write_bytes(b"frozen evidence")
+    entry = {"table": "evidence", "path": target.name, "sha256": file_hash(target)}
+    target.unlink()
+
+    def resolve(relative):
+        path = tmp_path / relative
+        path.write_bytes(b"frozen evidence")
+        return path
+
+    with Store(tmp_path, file_resolver=resolve) as store:
+        assert store.resolve_file(entry) == target
+        target.write_bytes(b"corrupt")
+        with pytest.raises(ValueError, match="checksum_mismatch"):
+            store.resolve_file(entry)
 
 
 def test_failed_page_is_atomic_and_does_not_move_checkpoint(tmp_path):

@@ -128,9 +128,9 @@ def freeze_event_slug_snapshot(root, slug, *, raw=None, stored_changes=None, wee
         store.begin(week, "qualification", "config")
         source = admit_event(raw, week, week.open_at)
         source.update(stored_changes or {})
-        store.event(week.id, "42", source, "collected")
+        store.event(week.id, source["event_id"], source, "collected")
         for kind in ("comments", "trades"):
-            store.page(week.id, "42", kind, "empty", [], None, True)
+            store.page(week.id, source["event_id"], kind, "empty", [], None, True)
         store.discovery_complete(week.id)
         return store.freeze(week, week.freeze_at)
 
@@ -250,17 +250,16 @@ def test_full_and_balanced_exports_keep_frozen_members_when_gt_changes(tmp_path)
         path = f"batches/{week.id}/V1/manifest.json"
         index = publication_index({}, frozen, path)
         exports = index["exports"] = build_exports(store, index, "unused", "unused")
-        assert {e["path"] for e in exports} == {
-            "full/basic.jsonl",
-            "full/extended.jsonl",
-            "balanced/basic.jsonl",
-            "balanced/extended.jsonl",
+        assert {(e["view"], e["format"]) for e in exports} == {
+            (view, name) for view in ("full", "balanced") for name in ("basic", "extended")
         }
 
         def rows(view):
             return {
                 row["event_id"]: row
-                for row in (json.loads(line) for line in (tmp_path / "exports" / view / "basic.jsonl").open())
+                for entry in index["exports"]
+                if entry["view"] == view and entry["format"] == "basic"
+                for row in (json.loads(line) for line in (tmp_path / entry["local_path"]).open())
             }
 
         full, balanced = rows("full"), rows("balanced")
@@ -370,6 +369,593 @@ def test_nonempty_export_requires_frozen_source_evidence(tmp_path):
     for extended in (False, True):
         with pytest.raises(ValueError, match="v1_evidence_missing"):
             export_jsonl(tmp_path, manifest, io.StringIO(), extended=extended)
+
+
+def test_frozen_metadata_keeps_slug_without_reopening_the_source_archive(tmp_path):
+    manifest = freeze_event_slug_snapshot(tmp_path, "frozen-slug")
+    archive = next(entry for entry in manifest["files"] if entry["table"] == "evidence")
+    (tmp_path / archive["path"]).unlink()
+    output = io.StringIO()
+    export_jsonl(tmp_path, manifest, output, extended=True)
+    assert json.loads(output.getvalue())["slug"] == "frozen-slug"
+
+
+def test_sharded_exports_use_stable_source_partitions_and_keep_single_large_records(tmp_path):
+    from foreseebench.delivery import build_exports
+    from foreseebench.store import Store, read_manifest
+
+    frozen = freeze_event_slug_snapshot(tmp_path, "partitioned")
+    index = publication_index({}, frozen, "batches/2026-11-02/V1/manifest.json")
+    with Store(tmp_path) as store:
+        entries = build_exports(store, index, "unused", "unused", target_bytes=64)
+    assert {(entry["view"], entry["format"]) for entry in entries} == {
+        (view, name) for view in ("full", "balanced") for name in ("basic", "extended")
+    }
+    assert index["export_layout"]["target_bytes"] == 64
+    for entry in entries:
+        assert entry["path"].startswith(f"{entry['view']}/{entry['format']}/")
+        assert entry["path"].endswith(entry["sha256"] + ".jsonl")
+        assert entry["counts"] == {"events": 1, "comments": 0, "trades": 0}
+        assert json.loads((tmp_path / entry["local_path"]).read_text())["slug"] == "partitioned"
+    stats = read_manifest(tmp_path / index["statistics"]["local_path"])
+    assert stats["cumulative"]["full"] == {"events": 1, "comments": 0, "trades": 0}
+
+
+def test_incremental_export_reuses_old_shards_without_hydrating_historical_batches(tmp_path, monkeypatch):
+    import shutil
+
+    from test_contract import raw_event
+
+    import foreseebench.delivery as module
+    from foreseebench.store import Store, read_manifest
+
+    first = freeze_event_slug_snapshot(tmp_path, "first")
+    index = publication_index({}, first, "batches/2026-11-02/V1/manifest.json")
+    with Store(tmp_path) as store:
+        index["exports"] = module.build_exports(store, index, "unused", "initial")
+    prior_paths = {entry["path"] for entry in index["exports"]}
+    shutil.rmtree(tmp_path / "batches" / "2026-11-02")
+    raw = raw_event()
+    raw["id"] = "43"
+    raw["markets"][0]["endDate"] = "2026-11-13T20:00:00Z"
+    second = freeze_event_slug_snapshot(tmp_path, "second", raw=raw, week_id="2026-11-09")
+
+    def download(repo_id, path, **kwargs):
+        raise AssertionError(f"不应恢复历史原件: {path}")
+
+    monkeypatch.setattr(module, "hf_hub_download", download)
+    index = publication_index(index, second, "batches/2026-11-09/V1/manifest.json")
+    with Store(tmp_path) as store:
+        index["exports"] = module.build_exports(store, index, "unused", "next")
+    assert prior_paths <= {entry["path"] for entry in index["exports"]}
+    stats = read_manifest(tmp_path / index["statistics"]["local_path"])
+    assert stats["cumulative"]["full"]["events"] == 2
+    assert stats["cumulative"]["balanced"]["events"] == 2
+
+
+def fake_dataset_hub(root, monkeypatch):
+    import hashlib
+    import shutil
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from huggingface_hub import CommitOperationDelete
+
+    import foreseebench.delivery as module
+
+    class Hub:
+        head = "initial"
+
+        def __init__(self):
+            self.commits = []
+            self.downloads = []
+            self.preuploads = []
+            (root / self.head).mkdir(parents=True)
+
+        def repo_info(self, *args, **kwargs):
+            return SimpleNamespace(sha=self.head)
+
+        def file_exists(self, repo_id, path, **kwargs):
+            return (root / kwargs["revision"] / path).is_file()
+
+        def preupload_lfs_files(self, *args, **kwargs):
+            self.preuploads.append([operation.path_in_repo for operation in kwargs["additions"]])
+
+        def get_paths_info(self, repo_id, paths, **kwargs):
+            result = []
+            for name in paths:
+                data = (root / kwargs["revision"] / name).read_bytes()
+                blob = hashlib.sha1(f"blob {len(data)}\0".encode() + data).hexdigest()
+                result.append(SimpleNamespace(path=name, size=len(data), blob_id=blob, lfs=None))
+            return result
+
+        def create_commit(self, *args, **kwargs):
+            assert kwargs["parent_commit"] == self.head
+            operations = kwargs["operations"]
+            self.commits.append(operations)
+            new = f"commit-{len(self.commits)}"
+            shutil.copytree(root / self.head, root / new)
+            for operation in operations:
+                target = root / new / operation.path_in_repo
+                if isinstance(operation, CommitOperationDelete):
+                    target.unlink()
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    value = operation.path_or_fileobj
+                    target.write_bytes(value if isinstance(value, bytes) else Path(value).read_bytes())
+            self.head = new
+            return SimpleNamespace(oid=new)
+
+        def download(self, repo_id, filename, **kwargs):
+            self.downloads.append((kwargs["revision"], filename))
+            return str(root / kwargs["revision"] / filename)
+
+    hub = Hub()
+    monkeypatch.setattr(module, "HfApi", lambda: hub)
+    monkeypatch.setattr(module, "hf_hub_download", hub.download)
+    return hub
+
+
+def test_publication_guard_receives_every_operation_before_any_upload(tmp_path, monkeypatch):
+    import foreseebench.delivery as module
+    from foreseebench.store import Store
+
+    root = tmp_path / "local"
+    hub = fake_dataset_hub(tmp_path / "hub", monkeypatch)
+    manifest = freeze_event_slug_snapshot(root, "quota")
+    operations = []
+
+    def reject(pending):
+        operations.extend(pending)
+        assert hub.preuploads == []
+        assert hub.commits == []
+        raise RuntimeError("publication_quota_exceeded")
+
+    with Store(root, before_publish=reject) as store:
+        with pytest.raises(RuntimeError, match="publication_quota_exceeded"):
+            module.publish(store, root / "batches/2026-11-02/V1/manifest.json", "fixture/repo", "qualification")
+    names = {operation.path_in_repo for operation in operations}
+    assert {"manifest.json", "README.md", "README.en.md", "statistics.json"} <= names
+    assert {entry["path"] for entry in manifest["files"]} <= names
+    assert "batches/2026-11-02/V1/manifest.json" in names
+    assert any(name.startswith("full/basic/") for name in names)
+    assert any(name.startswith("balanced/extended/") for name in names)
+    assert hub.preuploads == []
+    assert hub.commits == []
+
+
+def test_publication_guard_also_blocks_a_card_only_commit(tmp_path, monkeypatch):
+    import foreseebench.delivery as module
+    from foreseebench.store import Store
+
+    root, remote = tmp_path / "local", tmp_path / "hub"
+    hub = fake_dataset_hub(remote, monkeypatch)
+    freeze_event_slug_snapshot(root, "quota")
+    path = root / "batches/2026-11-02/V1/manifest.json"
+    with Store(root) as store:
+        module.publish(store, path, "fixture/repo", "qualification")
+    (remote / hub.head / "README.en.md").write_text("previous card")
+    hub.preuploads.clear()
+    guarded = []
+
+    def reject(operations):
+        guarded.extend(operation.path_in_repo for operation in operations)
+        raise RuntimeError("publication_quota_unknown")
+
+    with Store(root, before_publish=reject) as store:
+        with pytest.raises(RuntimeError, match="publication_quota_unknown"):
+            module.publish(store, path, "fixture/repo", "qualification")
+    assert guarded == ["README.en.md"]
+    assert len(hub.commits) == 1
+    assert hub.preuploads == []
+    assert (remote / hub.head / "README.en.md").read_text() == "previous card"
+
+
+def test_publication_retry_rechecks_the_complete_operation_identity_before_upload(tmp_path, monkeypatch):
+    import httpx
+
+    import foreseebench.delivery as module
+    from foreseebench.store import Store
+
+    root = tmp_path / "local"
+    hub = fake_dataset_hub(tmp_path / "hub", monkeypatch)
+    freeze_event_slug_snapshot(root, "quota-retry")
+    sequence = []
+    guarded = []
+    upload = hub.preupload_lfs_files
+    commit = hub.create_commit
+
+    def guard(operations):
+        sequence.append("guard")
+        guarded.append(
+            [
+                (operation.path_in_repo, operation.upload_info.sha256, operation.upload_info.size)
+                for operation in operations
+            ]
+        )
+
+    def flaky_upload(*args, **kwargs):
+        sequence.append("upload")
+        if sequence.count("upload") == 1:
+            raise httpx.ConnectError("retry preupload")
+        upload(*args, **kwargs)
+
+    def create_commit(*args, **kwargs):
+        sequence.append("commit")
+        return commit(*args, **kwargs)
+
+    monkeypatch.setattr(hub, "preupload_lfs_files", flaky_upload)
+    monkeypatch.setattr(hub, "create_commit", create_commit)
+    monkeypatch.setattr(module.time, "sleep", lambda seconds: None)
+    with Store(root, before_publish=guard) as store:
+        module.publish(store, root / "batches/2026-11-02/V1/manifest.json", "fixture/repo", "qualification")
+    assert sequence == ["guard", "upload", "guard", "upload", "commit"]
+    assert len(guarded) == 2
+    assert guarded[0] == guarded[1]
+    assert {name for name, _, _ in guarded[0]} == {operation.path_in_repo for operation in hub.commits[0]}
+
+
+def test_incremental_publish_uploads_and_reads_back_only_changed_views(tmp_path, monkeypatch):
+    import shutil
+
+    from test_contract import raw_event
+
+    import foreseebench.delivery as module
+    from foreseebench.store import Store, read_manifest
+
+    root, remote = tmp_path / "local", tmp_path / "hub"
+    hub = fake_dataset_hub(remote, monkeypatch)
+    freeze_event_slug_snapshot(root, "first")
+    with Store(root) as store:
+        module.publish(store, root / "batches/2026-11-02/V1/manifest.json", "fixture/repo", "qualification")
+    previous = read_manifest(remote / hub.head / "manifest.json")
+    old_views = {entry["path"] for entry in previous["exports"]}
+    receipt_path = root / "batches/2026-11-02/V1/publication.json"
+    completed = receipt_path.read_bytes()
+    shutil.rmtree(root / "batches/2026-11-02")
+    receipt_path.parent.mkdir(parents=True)
+    receipt_path.write_bytes(completed)
+    shutil.rmtree(root / "exports")
+    raw = raw_event()
+    raw["id"] = "43"
+    raw["markets"][0]["endDate"] = "2026-11-13T20:00:00Z"
+    freeze_event_slug_snapshot(root, "second", raw=raw, week_id="2026-11-09")
+    hub.downloads.clear()
+    with Store(root) as store:
+        receipt = module.publish(store, root / "batches/2026-11-09/V1/manifest.json", "fixture/repo", "qualification")
+    uploaded = {operation.path_in_repo for operation in hub.commits[-1]}
+    assert not old_views & uploaded
+    assert not old_views & {name for _, name in hub.downloads}
+    assert not any(name.startswith("batches/2026-11-02/") for _, name in hub.downloads)
+    current = read_manifest(remote / hub.head / "manifest.json")
+    assert len(current["export_members"]) == 2
+    assert set(receipt["verified_artifacts"]) == {entry["path"] for entry in current["exports"]} | {"statistics.json"}
+
+
+def test_publish_retry_completes_the_first_readback_after_a_committed_disconnect(tmp_path, monkeypatch):
+    import httpx
+
+    import foreseebench.delivery as module
+    from foreseebench.store import Store
+
+    root = tmp_path / "local"
+    hub = fake_dataset_hub(tmp_path / "hub", monkeypatch)
+    freeze_event_slug_snapshot(root, "retry")
+    failed = []
+    recovered = []
+
+    def download(repo_id, filename, **kwargs):
+        if filename.startswith("balanced/basic/"):
+            if not failed:
+                failed.append(filename)
+                raise httpx.ReadError("commit succeeded, readback disconnected")
+            recovered.append(filename)
+        return hub.download(repo_id, filename, **kwargs)
+
+    monkeypatch.setattr(module, "hf_hub_download", download)
+    monkeypatch.setattr(module.time, "sleep", lambda seconds: None)
+    with Store(root) as store:
+        receipt = module.publish(store, root / "batches/2026-11-02/V1/manifest.json", "fixture/repo", "qualification")
+    assert failed == recovered
+    assert len(hub.commits) == 1
+    assert receipt["revision"] == hub.head
+
+
+def test_publishing_another_batch_finishes_unacknowledged_predecessor_readback(tmp_path, monkeypatch):
+    from test_contract import raw_event
+
+    import foreseebench.delivery as module
+    from foreseebench.store import Store
+
+    root = tmp_path / "local"
+    hub = fake_dataset_hub(tmp_path / "hub", monkeypatch)
+    freeze_event_slug_snapshot(root, "interrupted")
+    failed = []
+
+    def interrupted(repo_id, filename, **kwargs):
+        if filename.startswith("balanced/basic/"):
+            failed.append(filename)
+            raise OSError("process interrupted after commit")
+        return hub.download(repo_id, filename, **kwargs)
+
+    monkeypatch.setattr(module, "hf_hub_download", interrupted)
+    with Store(root) as store:
+        with pytest.raises(OSError):
+            module.publish(store, root / "batches/2026-11-02/V1/manifest.json", "fixture/repo", "qualification")
+    raw = raw_event()
+    raw["id"] = "43"
+    raw["markets"][0]["endDate"] = "2026-11-13T20:00:00Z"
+    freeze_event_slug_snapshot(root, "next", raw=raw, week_id="2026-11-09")
+    monkeypatch.setattr(module, "hf_hub_download", hub.download)
+    hub.downloads.clear()
+    with Store(root) as store:
+        module.publish(store, root / "batches/2026-11-09/V1/manifest.json", "fixture/repo", "qualification")
+    assert set(failed) <= {name for _, name in hub.downloads}
+
+
+def test_download_view_cli_pins_the_commit_and_concatenates_exact_shard_bytes_without_local_state(
+    tmp_path, monkeypatch, capsys
+):
+    import hashlib
+    import sys
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    import foreseebench.cli as cli
+    import foreseebench.delivery as module
+    from foreseebench.contract import dumps
+
+    first = b'{"source_id":"source-1","event_id":"1","token_trade_history":[{"price":0.1234567890123456789}]}\n'
+    second = '{"source_id":"source-2","event_id":"2","title":"中文\\n原文","token_trade_history":[]}\n'.encode()
+    paths = ["full/extended/a/first.jsonl", "full/extended/b/second.jsonl"]
+    shards = dict(zip(paths, (first, second), strict=True))
+    manifest = {
+        "exports": [
+            {
+                "path": path,
+                "format": "extended",
+                "view": "full",
+                "bytes": len(shards[path]),
+                "sha256": hashlib.sha256(shards[path]).hexdigest(),
+                "counts": {"events": 1, "comments": 0, "trades": 1 if index == 0 else 0},
+            }
+            for index, path in enumerate(paths)
+        ]
+        + [{"path": "balanced/basic/unrelated.jsonl", "format": "basic", "view": "balanced"}],
+    }
+    downloads = []
+    temporary_paths = []
+
+    class Hub:
+        def repo_info(self, repo_id, **kwargs):
+            assert repo_id == "fixture/repo"
+            assert kwargs == {"repo_type": "dataset", "revision": "main"}
+            return SimpleNamespace(sha="frozen-commit")
+
+    def download(repo_id, path, **kwargs):
+        assert repo_id == "fixture/repo"
+        assert kwargs["revision"] == "frozen-commit"
+        assert kwargs["repo_type"] == "dataset"
+        assert all(not prior.exists() for prior in temporary_paths)
+        downloads.append(path)
+        destination = Path(kwargs["cache_dir"]) / "downloaded"
+        destination.write_bytes((dumps(manifest) + "\n").encode() if path == "manifest.json" else shards[path])
+        temporary_paths.append(destination)
+        return str(destination)
+
+    monkeypatch.setattr(module, "HfApi", Hub)
+    monkeypatch.setattr(module, "hf_hub_download", download)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "foreseebench",
+            "download-view",
+            "--repo",
+            "fixture/repo",
+            "--revision",
+            "main",
+            "--format",
+            "extended",
+            "--view",
+            "full",
+            "--output",
+            "combined.jsonl",
+        ],
+    )
+    cli.main()
+    assert (tmp_path / "combined.jsonl").read_bytes() == first + second
+    receipt = json.loads(capsys.readouterr().out)
+    assert receipt["revision"] == "frozen-commit"
+    assert receipt["counts"] == {"events": 2, "comments": 0, "trades": 1}
+    assert downloads == ["manifest.json", *paths]
+    assert all(not path.exists() for path in temporary_paths)
+    assert list(tmp_path.iterdir()) == [tmp_path / "combined.jsonl"]
+
+
+@pytest.mark.parametrize("failure", ["checksum", "count", "duplicate_source"])
+def test_download_view_rejects_bad_shards_without_overwriting_the_existing_output(tmp_path, monkeypatch, failure):
+    import hashlib
+
+    import foreseebench.delivery as module
+    from foreseebench.store import atomic_json
+
+    remote = tmp_path / "hub"
+    hub = fake_dataset_hub(remote, monkeypatch)
+    original = b"previous verified export\n"
+    output = tmp_path / "combined.jsonl"
+    output.write_bytes(original)
+    entries = []
+    for index in (1, 2):
+        identifier = 1 if failure == "duplicate_source" else index
+        body = f'{{"source_id":"source-{identifier}","event_id":"{identifier}"}}\n'.encode()
+        path = f"full/basic/{index}.jsonl"
+        local = remote / hub.head / path
+        local.parent.mkdir(parents=True, exist_ok=True)
+        local.write_bytes(body)
+        entries.append(
+            {
+                "path": path,
+                "format": "basic",
+                "view": "full",
+                "bytes": len(body),
+                "sha256": hashlib.sha256(body).hexdigest(),
+                "counts": {"events": 2 if failure == "count" and index == 2 else 1, "comments": 0, "trades": 0},
+            }
+        )
+        if failure == "checksum" and index == 2:
+            local.write_bytes(b"x" + body[1:])
+    atomic_json(remote / hub.head / "manifest.json", {"exports": entries})
+    with pytest.raises(
+        ValueError,
+        match={
+            "checksum": "remote_view_readback_failed",
+            "count": "export_count_mismatch",
+            "duplicate_source": "duplicate_source_in_export",
+        }[failure],
+    ):
+        module.download_view("fixture/repo", output)
+    assert output.read_bytes() == original
+    assert set(tmp_path.iterdir()) == {remote, output}
+
+
+def test_download_view_preserves_an_empty_split_without_placeholder_records(tmp_path, monkeypatch):
+    import hashlib
+
+    import foreseebench.delivery as module
+    from foreseebench.store import atomic_json
+
+    remote = tmp_path / "hub"
+    hub = fake_dataset_hub(remote, monkeypatch)
+    path = "balanced/extended/empty.jsonl"
+    source = remote / hub.head / path
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"")
+    atomic_json(
+        remote / hub.head / "manifest.json",
+        {
+            "exports": [
+                {
+                    "path": path,
+                    "format": "extended",
+                    "view": "balanced",
+                    "bytes": 0,
+                    "sha256": hashlib.sha256(b"").hexdigest(),
+                    "counts": {"events": 0, "comments": 0, "trades": 0},
+                }
+            ],
+        },
+    )
+    output = tmp_path / "empty.jsonl"
+    receipt = module.download_view("fixture/repo", output, format="extended", view="balanced")
+    assert output.read_bytes() == b""
+    assert receipt["counts"] == {"events": 0, "comments": 0, "trades": 0}
+    assert receipt["bytes"] == 0
+    assert set(tmp_path.iterdir()) == {remote, output}
+
+
+def test_replacing_one_snapshot_keeps_other_members_and_exact_fills_from_the_same_shard(tmp_path, monkeypatch):
+    import shutil
+    from decimal import Decimal
+
+    import simplejson
+    from test_contract import raw_event
+
+    import foreseebench.delivery as module
+    from foreseebench.contract import Week, admit_event
+    from foreseebench.store import Store, read_manifest
+
+    root, remote = tmp_path / "local", tmp_path / "hub"
+    hub = fake_dataset_hub(remote, monkeypatch)
+    week = Week.parse("2026-11-02")
+    with Store(root) as store:
+        store.begin(week, "qualification", "config")
+        for identifier in ("26", "31", "42"):
+            raw = dict(raw_event(), id=identifier)
+            archive_event_source(root, raw)
+            source = admit_event(raw, week, week.open_at)
+            store.event(week.id, identifier, source, "collected")
+            store.page(week.id, identifier, "comments", "empty", [], None, True)
+            fill = {"event_id": identifier, "row_id": "a", "price_per_share": "0.1234567890123456789", "shares": "2"}
+            store.page(week.id, identifier, "trades", "page", [fill, dict(fill, row_id="b")], None, True)
+        store.discovery_complete(week.id)
+        frozen = store.freeze(week, week.freeze_at)
+        initial = publication_index({}, frozen, f"batches/{week.id}/V1/manifest.json")
+        split = module.build_exports(store, initial, "unused", "unused", target_bytes=1200)
+        assert all(entry["bytes"] <= 1200 or entry["counts"]["events"] == 1 for entry in split)
+        assert len([entry for entry in split if entry["view"] == "full" and entry["format"] == "basic"]) >= 2
+        module.publish(store, root / f"batches/{week.id}/V1/manifest.json", "fixture/repo", "qualification")
+    old = read_manifest(remote / hub.head / "manifest.json")
+    assert len(old["exports"]) == 4
+    assert all(entry["partition"] == "7" for entry in old["exports"])
+    shutil.rmtree(root / f"batches/{week.id}")
+    shutil.rmtree(root / "exports")
+    raw = raw_event()
+    raw["title"] = "新的完整快照"
+    raw["markets"][0]["endDate"] = "2026-11-13T20:00:00Z"
+    freeze_event_slug_snapshot(root, "latest", raw=raw, week_id="2026-11-09")
+    hub.downloads.clear()
+    with Store(root) as store:
+        module.publish(store, root / "batches/2026-11-09/V1/manifest.json", "fixture/repo", "qualification")
+    current = read_manifest(remote / hub.head / "manifest.json")
+    rows = {
+        row["event_id"]: row
+        for entry in current["exports"]
+        if entry["view"] == "full" and entry["format"] == "extended"
+        for row in (simplejson.loads(line, use_decimal=True) for line in (remote / hub.head / entry["path"]).open())
+    }
+    assert set(rows) == {"26", "31", "42"}
+    assert rows["42"]["title"] == "新的完整快照"
+    assert rows["42"]["token_trade_history"] == []
+    for identifier in ("26", "31"):
+        assert rows[identifier]["batch_id"] == week.id
+        assert len(rows[identifier]["token_trade_history"]) == 2
+        assert rows[identifier]["token_trade_history"][0]["price_per_share"] == Decimal("0.1234567890123456789")
+    assert not any(name.startswith(f"batches/{week.id}/") for _, name in hub.downloads)
+
+
+def test_first_publish_hydrates_the_canonical_archive_even_with_remote_verification(tmp_path, monkeypatch):
+    import foreseebench.delivery as module
+    from foreseebench.store import Store
+
+    root, remote = tmp_path / "local", tmp_path / "hub"
+    hub = fake_dataset_hub(remote, monkeypatch)
+    manifest = freeze_event_slug_snapshot(root, "frozen")
+    archive = next(entry for entry in manifest["files"] if entry["table"] == "evidence")
+    path = root / archive["path"]
+    original = path.read_bytes()
+    path.unlink()
+    restored = []
+
+    def resolve(relative):
+        restored.append(relative)
+        target = root / relative
+        target.write_bytes(original)
+        return target
+
+    with Store(root, immutable_verifier=lambda entry: entry == archive, file_resolver=resolve) as store:
+        module.publish(store, root / "batches/2026-11-02/V1/manifest.json", "fixture/repo", "qualification")
+    assert restored == [archive["path"]]
+    assert (remote / hub.head / archive["path"]).read_bytes() == original
+
+
+def test_republish_rejects_a_reused_remote_shard_with_changed_content(tmp_path, monkeypatch):
+    import foreseebench.delivery as module
+    from foreseebench.store import Store, read_manifest
+
+    root, remote = tmp_path / "local", tmp_path / "hub"
+    hub = fake_dataset_hub(remote, monkeypatch)
+    freeze_event_slug_snapshot(root, "frozen")
+    path = root / "batches/2026-11-02/V1/manifest.json"
+    with Store(root) as store:
+        module.publish(store, path, "fixture/repo", "qualification")
+        index = read_manifest(remote / hub.head / "manifest.json")
+        shard = remote / hub.head / index["exports"][0]["path"]
+        original = shard.read_bytes()
+        shard.write_bytes(b"x" + original[1:])
+        with pytest.raises(ValueError, match="remote_view_readback_failed"):
+            module.publish(store, path, "fixture/repo", "qualification")
 
 
 @pytest.mark.parametrize("event_description", [None, "原始规则", "事件描述，与市场规则不同"])
@@ -569,8 +1155,10 @@ def test_first_v3_publish_contains_parent_manifest_and_its_files(tmp_path, monke
         uploaded = {o.path_in_repo for o in operations}
         assert v3["parent_manifest"] in uploaded
         assert {f["path"] for f in v1["files"]} <= uploaded
-        assert module.EXPORT_PATHS | {"statistics.json"} <= uploaded
-        assert module.EXPORT_PATHS | {"statistics.json"} <= set(downloads)
+        remote_index = json.loads((remote_root / "manifest.json").read_text())
+        view_paths = {entry["path"] for entry in remote_index["exports"]}
+        assert view_paths | {"statistics.json"} <= uploaded
+        assert view_paths | {"statistics.json"} <= set(downloads)
         assert {"README.md", "README.en.md"} <= uploaded
 
 
@@ -627,6 +1215,16 @@ def test_republish_updates_only_changed_cards_and_then_becomes_unchanged(tmp_pat
         def file_exists(self, repo_id, path, **kwargs):
             return (remote / path).is_file()
 
+        def get_paths_info(self, repo_id, paths, **kwargs):
+            from foreseebench.store import file_hash
+
+            return [
+                SimpleNamespace(
+                    path=name, size=(remote / name).stat().st_size, lfs=SimpleNamespace(sha256=file_hash(remote / name))
+                )
+                for name in paths
+            ]
+
         def preupload_lfs_files(self, *args, **kwargs):
             raise AssertionError("文档更新不应上传数据文件")
 
@@ -680,13 +1278,17 @@ def test_republish_updates_only_changed_cards_and_then_becomes_unchanged(tmp_pat
         assert (remote / "manifest.json").read_bytes() == original_index
 
 
-def test_export_reads_hub_snapshot_symlinks_for_remote_historical_batches(tmp_path, monkeypatch):
+@pytest.mark.parametrize("legacy_metadata", [False, True])
+def test_export_reads_hub_snapshot_symlinks_for_remote_historical_batches(tmp_path, monkeypatch, legacy_metadata):
     import foreseebench.delivery as module
-    from foreseebench.store import Store, file_hash
+    from foreseebench.store import Store, atomic_json, file_hash
 
     original = tmp_path / "original"
     manifest = freeze_event_slug_snapshot(original, "frozen-event-slug")
     name = "batches/2026-11-02/V1/manifest.json"
+    if legacy_metadata:
+        manifest["files"] = [entry for entry in manifest["files"] if entry["table"] != "source_metadata"]
+        atomic_json(original / name, manifest)
     snapshot = tmp_path / "cache/snapshots/revision"
     blobs = tmp_path / "cache/blobs"
     blobs.mkdir(parents=True)
@@ -706,9 +1308,12 @@ def test_export_reads_hub_snapshot_symlinks_for_remote_historical_batches(tmp_pa
     monkeypatch.setattr(module, "hf_hub_download", download)
     with Store(tmp_path / "consumer") as consumer:
         entries = module.build_exports(consumer, publication_index({}, manifest, name), "owner/repo", "revision")
-    assert {e["path"] for e in entries} == module.EXPORT_PATHS
+    assert {(e["view"], e["format"]) for e in entries} == {
+        (view, name) for view in ("full", "balanced") for name in ("basic", "extended")
+    }
     assert all(e["counts"]["events"] == 1 for e in entries)
-    assert "batches/2026-11-02/raw-v1.sqlite" in downloaded
+    assert ("batches/2026-11-02/raw-v1.sqlite" in downloaded) is legacy_metadata
+    assert ("batches/2026-11-02/V1/source-metadata.json" in downloaded) is not legacy_metadata
     for entry in entries:
         row = json.loads((tmp_path / "consumer" / entry["local_path"]).read_text())
         assert row["slug"] == "frozen-event-slug"

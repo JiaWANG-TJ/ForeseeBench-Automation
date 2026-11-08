@@ -62,12 +62,12 @@ def prepare_v2(store, root):
     return week, raw, source, task
 
 
-def test_release_rejects_a_publication_that_would_exceed_the_whole_cycle_budget(tmp_path):
+def test_delayed_publication_rechecks_native_sources_even_when_total_cycle_exceeds_twelve_days(tmp_path):
     from foreseebench.benchmark import release_benchmark, validate_stage_result
 
     class Native:
         def event(self, event_id):
-            raise AssertionError("超过整批预算后不应开始发布核验请求")
+            raise OSError("native_revalidation_started")
 
     with Store(tmp_path) as store:
         _, _, _, task = prepare_v2(store, tmp_path)
@@ -80,7 +80,7 @@ def test_release_rejects_a_publication_that_would_exceed_the_whole_cycle_budget(
                 "evidence": ["fixture-only"],
             },
         )
-        with pytest.raises(ValueError, match="publication_misses_cycle_budget"):
+        with pytest.raises(OSError, match="native_revalidation_started"):
             release_benchmark(store, Native(), task["task_id"], clock=lambda: instant("2026-11-06T17:00:00Z"))
 
 

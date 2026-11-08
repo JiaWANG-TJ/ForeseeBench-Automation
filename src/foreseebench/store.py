@@ -8,11 +8,14 @@ import importlib.metadata
 import os
 import threading
 from collections import Counter, defaultdict
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from datetime import datetime
 from functools import wraps
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from huggingface_hub import CommitOperationAdd, CommitOperationDelete
 
 import duckdb
 import pyarrow as pa
@@ -217,9 +220,15 @@ class Store:
         row_group_bytes: int = 64 * 1024**2,
         shard_bytes: int = 512 * 1024**2,
         memory_limit: str = "1GB",
+        immutable_verifier: Callable[[Record], bool] | None = None,
+        file_resolver: Callable[[str], Path] | None = None,
+        before_publish: Callable[[list[CommitOperationAdd | CommitOperationDelete]], None] | None = None,
     ):
         self.root = root.resolve()
         self.root.mkdir(parents=True, exist_ok=True)
+        self.immutable_verifier = immutable_verifier
+        self.file_resolver = file_resolver
+        self.before_publish = before_publish
         self.lock = (self.root / "writer.lock").open("a+")
         try:
             fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -819,6 +828,26 @@ class Store:
                     "rows": 0,
                 }
             )
+            from .delivery import frozen_event_metadata
+
+            metadata_path = destination / "source-metadata.json"
+            atomic_json(
+                metadata_path,
+                {
+                    "schema_version": "1.0",
+                    "archive_sha256": files[-1]["sha256"],
+                    "events": frozen_event_metadata(self.root, {"files": files}),
+                },
+            )
+            files.append(
+                {
+                    "table": "source_metadata",
+                    "path": str(metadata_path.relative_to(self.root)),
+                    "sha256": file_hash(metadata_path),
+                    "bytes": metadata_path.stat().st_size,
+                    "rows": sum(entry["rows"] for entry in files if entry["table"] == "events"),
+                }
+            )
         from .benchmark import select_events
 
         inventory, exclusions = self.write_source_inventory(week.id, destination)
@@ -1083,11 +1112,30 @@ class Store:
         self.activate(destination / "manifest.json", manifest)
         return manifest
 
+    def resolve_file(self, entry: Record) -> Path:
+        """按冻结哈希恢复实际文件；远端存在证明不能替代首次发布所需原件。"""
+        path = (self.root / entry["path"]).resolve()
+        if not path.is_relative_to(self.root):
+            raise ValueError("manifest_path_invalid")
+        if not path.is_file() and self.file_resolver:
+            restored = self.file_resolver(entry["path"]).resolve()
+            if restored != path:
+                raise ValueError("resolved_path_mismatch")
+        if not path.is_file():
+            raise ValueError("manifest_path_invalid")
+        if file_hash(path) != entry["sha256"]:
+            raise ValueError(f"checksum_mismatch:{entry['path']}")
+        return path
+
     def verify(self, manifest: Record) -> Record:
         counts = {t: 0 for t in SCHEMAS}
         for entry in manifest["files"]:
             path = (self.root / entry["path"]).resolve()
-            if not path.is_relative_to(self.root) or not path.is_file():
+            if not path.is_relative_to(self.root):
+                raise ValueError("manifest_path_invalid")
+            if not path.is_file():
+                if entry["table"] not in SCHEMAS and self.immutable_verifier and self.immutable_verifier(entry):
+                    continue
                 raise ValueError("manifest_path_invalid")
             if file_hash(path) != entry["sha256"]:
                 raise ValueError(f"checksum_mismatch:{entry['path']}")

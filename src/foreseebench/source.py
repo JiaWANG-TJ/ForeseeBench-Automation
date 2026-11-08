@@ -35,11 +35,16 @@ ARCHIVE_SCHEMA = """
 """
 
 
+class WorkYield(Exception):
+    """本次 runner 预算用尽；已有进度保留，不能把任务记为完成。"""
+
+
 class EvidenceError(RuntimeError):
     """部分请求失败时，仍交付此前完整取得的原生证据及回执。"""
 
     def __init__(self, cause: Exception, resolutions: list[Record], tokens: list[Record], receipts: list[Record]):
         super().__init__(f"{type(cause).__name__}:{cause}")
+        self.cause = cause
         self.partial = (resolutions, tokens, receipts)
 
 
@@ -327,9 +332,13 @@ class Polymarket:
         workers: int = 1,
         transport_factory: Callable[[], httpx.BaseTransport] | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        stop_at: datetime | None = None,
+        cancel_event: threading.Event | None = None,
     ):
         self.gamma_url, self.data_url = gamma_url.rstrip("/"), data_url.rstrip("/")
         self.clock, self.attempts, self.rate = clock, attempts, rate
+        self.stop_at = stop_at
+        self.cancel_event = cancel_event
         if not 1 <= workers <= 16 or rate <= 0 or attempts < 1:
             raise ValueError("invalid_network_limits")
         self.workers = workers
@@ -343,6 +352,16 @@ class Polymarket:
         self.last_request = 0.0
         self.profile_lock = threading.Lock()
         self.profiles: OrderedDict[str, tuple[Record, Record]] = OrderedDict()
+
+    @property
+    def work_expired(self) -> bool:
+        return bool(self.cancel_event and self.cancel_event.is_set()) or (
+            self.stop_at is not None and self.clock() >= self.stop_at
+        )
+
+    def require_budget(self) -> None:
+        if self.work_expired:
+            raise WorkYield("runner_work_budget")
 
     def __enter__(self) -> Polymarket:
         return self
@@ -392,6 +411,7 @@ class Polymarket:
         url = (self.data_url if data else self.gamma_url) + path
         for attempt in range(self.attempts):
             delivered = False
+            self.require_budget()
             if deadline and self.clock() >= deadline:
                 raise TimeoutError("freeze_deadline")
             with self.rate_lock:
@@ -400,6 +420,7 @@ class Polymarket:
                     time.sleep(delay)
                 self.last_request = time.monotonic()
             requested = self.clock()
+            self.require_budget()
             if deadline and requested >= deadline:
                 raise TimeoutError("freeze_deadline")
             try:

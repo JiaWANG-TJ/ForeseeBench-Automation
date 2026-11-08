@@ -7,6 +7,7 @@ import importlib
 import shutil
 import sys
 import tomllib
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -16,9 +17,9 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from .benchmark import accept_submission, finalize_benchmark, release_benchmark, stage_output, validate_stage_result
 from .contract import Policy, Record, Week, dumps, instant, stamp
-from .delivery import export_jsonl, publish
+from .delivery import download_view, export_jsonl, publish
 from .pipeline import Pipeline, stage_task
-from .source import Polymarket
+from .source import Polymarket, WorkYield
 from .store import Store, atomic_json, file_hash, read_manifest
 
 
@@ -39,7 +40,15 @@ def settings(path: Path, qualification: bool = False) -> Record:
     return config
 
 
-def open_source(store: Store, config: Record, week_id: str, phase: str) -> Polymarket:
+def open_source(
+    store: Store,
+    config: Record,
+    week_id: str,
+    phase: str,
+    *,
+    clock: Callable[[], datetime] | None = None,
+    stop_at: datetime | None = None,
+) -> Polymarket:
     network = config["network"]
     return Polymarket(
         store.root / "batches" / week_id / f"raw-{phase.lower()}.sqlite",
@@ -49,7 +58,10 @@ def open_source(store: Store, config: Record, week_id: str, phase: str) -> Polym
         attempts=network["attempts"],
         rate=network["requests_per_second"],
         workers=network.get("workers", 1),
-        clock=lambda: datetime.now(UTC),
+        clock=clock or (lambda: datetime.now(UTC)),
+        stop_at=stop_at,
+        cancel_event=config.get("cancel_event"),
+        transport_factory=network.get("transport_factory"),
     )
 
 
@@ -99,14 +111,48 @@ def receive_stage_result(store: Store, task_id: str, artifact_path: Path) -> Rec
     return task
 
 
-def tick(config: Record) -> None:
-    now = datetime.now(UTC)
+def tick(
+    config: Record,
+    *,
+    clock: Callable[[], datetime] | None = None,
+    stop_at: datetime | None = None,
+    bootstrap: bool = False,
+    qualification: bool = False,
+    hydrate: Callable[[Store, Record], None] | None = None,
+) -> Record:
+    clock = clock or (lambda: datetime.now(UTC))
+    now = clock()
     week = Week.current(now, Policy.load(config.get("protocol")))
+
+    def expired() -> bool:
+        return bool(config.get("cancel_event") and config["cancel_event"].is_set()) or (
+            stop_at is not None and clock() >= stop_at
+        )
+
     with Store(**config["storage"]) as store:
         state_path = store.root / "scheduler.json"
         state = read_manifest(state_path) if state_path.exists() else {"last_refresh": {}}
         errors: dict[str, str] = {}
-        current = next((b for b in store.status() if b["id"] == week.id), None)
+        batches = store.status()
+        if bootstrap and not batches and not expired():
+            initial = Week.bootstrap(now, Policy.load(config.get("protocol")))
+            store.begin(initial, "qualification" if qualification else "bootstrap", config["config_hash"])
+
+        def advance_existing(batch: Record) -> None:
+            try:
+                advance_batch(store, config, batch, clock(), state, clock=clock, stop_at=stop_at, hydrate=hydrate)
+            except WorkYield:
+                return
+            except Exception as error:
+                errors[batch["id"]] = f"{type(error).__name__}:{error}"
+
+        kinds = {"qualification"} if qualification else {"formal", "bootstrap"}
+        frozen = [batch for batch in batches if batch["kind"] in kinds and batch["frozen"]]
+        for batch in sorted(frozen, key=lambda row: store.week(row["id"]).evidence_cutoff):
+            if expired():
+                break
+            advance_existing(batch)
+        current = next((b for b in batches if b["id"] == week.id), None)
         needs_collection = current is None or (
             current["kind"] == "formal"
             and not current["frozen"]
@@ -115,30 +161,72 @@ def tick(config: Record) -> None:
                 or any(s not in {"collected", "rejected"} for s, _ in current["event_states"])
             )
         )
-        if week.collection_start <= now < week.freeze_at and needs_collection:
+        if not qualification and week.collection_start <= now < week.freeze_at and needs_collection and not expired():
             try:
-                with open_source(store, config, week.id, "V1") as pm:
+                if hydrate and current:
+                    hydrate(store, current)
+                with open_source(store, config, week.id, "V1", clock=clock, stop_at=stop_at) as pm:
                     log(
-                        Pipeline(store, pm, clock=lambda: datetime.now(UTC)).collect(
+                        Pipeline(store, pm, clock=clock).collect(
                             week, "formal", config["config_hash"], progress=log, refresh_completed=False
                         )
                     )
             except Exception as error:
                 errors[week.id] = f"{type(error).__name__}:{error}"
-        now = datetime.now(UTC)
         for batch in store.status():
-            if batch["kind"] not in {"formal", "bootstrap"}:
+            if expired():
+                break
+            if batch["kind"] not in kinds or batch["frozen"]:
                 continue
-            try:
-                advance_batch(store, config, batch, now, state)
-            except Exception as error:
-                errors[batch["id"]] = f"{type(error).__name__}:{error}"
-        state.update(last_tick=stamp(now), last_error=errors or None)
+            advance_existing(batch)
+        now = clock()
+        state.update(last_tick=stamp(now), last_error=errors or None, yielded=expired())
         atomic_json(state_path, state)
-        log({"phase": "scheduler", "last_tick": stamp(now), "errors": errors})
+        result = {"phase": "scheduler", "last_tick": stamp(now), "errors": errors, "yielded": expired()}
+        phases: dict[str, int] = {}
+        counts: dict[str, int] = {}
+        for batch in store.status():
+            phase = (
+                "expired_incomplete"
+                if batch["id"] in state.get("collection_closed", {})
+                else "collecting"
+                if not batch["frozen"]
+                else "closed"
+                if batch["id"] in state.get("gt_closed", {})
+                else "awaiting_gt"
+            )
+            phases[phase] = phases.get(phase, 0) + 1
+            for status, count in batch["event_states"]:
+                counts[status] = counts.get(status, 0) + count
+        result["status"] = {
+            "date": now.date().isoformat(),
+            "phases": phases,
+            "source_event_counts": counts,
+            "stages": {"V2": "not_configured", "V4": "not_configured"},
+        }
+        log(result)
+        return result
 
 
-def advance_batch(store: Store, config: Record, batch: Record, now: datetime, state: Record) -> None:
+def advance_batch(
+    store: Store,
+    config: Record,
+    batch: Record,
+    now: datetime,
+    state: Record,
+    *,
+    clock: Callable[[], datetime] | None = None,
+    stop_at: datetime | None = None,
+    hydrate: Callable[[Store, Record], None] | None = None,
+) -> None:
+    clock = clock or (lambda: datetime.now(UTC))
+
+    def require_budget() -> None:
+        if (stop_at is not None and clock() >= stop_at) or (
+            config.get("cancel_event") and config["cancel_event"].is_set()
+        ):
+            raise WorkYield("runner_work_budget")
+
     week = store.week(batch["id"])
     if week.policy.read_only:
         state.setdefault("legacy_read_only", {})[week.id] = {
@@ -146,16 +234,59 @@ def advance_batch(store: Store, config: Record, batch: Record, now: datetime, st
             "frozen": batch["frozen"],
         }
         return
-    if batch["kind"] == "bootstrap" and not batch["frozen"]:
-        with open_source(store, config, week.id, "V1") as pm:
-            result = Pipeline(store, pm, clock=lambda: datetime.now(UTC)).collect(
-                week.id, "bootstrap", config["config_hash"], progress=log
-            )
-            log(result)
-            if not result["construction_complete"]:
-                raise ValueError("construction_incomplete")
+    incomplete = not batch["scan_complete"] or any(
+        status not in {"collected", "rejected"} for status, _ in batch["event_states"]
+    )
+    if not batch["frozen"] and incomplete and now >= week.freeze_at and batch["kind"] != "qualification":
+        closed_collections = state.setdefault("collection_closed", {})
+        if week.id not in closed_collections:
+            store.failure(week.id, None, "V1", now, "collection_incomplete_at_deadline")
+            closed_collections[week.id] = {
+                "deadline": stamp(week.freeze_at),
+                "closed_at": stamp(now),
+                "status": "expired_incomplete",
+            }
+        log({"phase": "collection_closed", "batch_id": week.id, **closed_collections[week.id]})
+        return
+    release_path = store.root / "batches" / week.id / "benchmark" / "release.json"
+    effective = Week.restore(read_manifest(release_path)["protocol"]) if release_path.exists() else week
+    pointer = store.root / "batches" / week.id / "latest.json"
+    closed = state.setdefault("gt_closed", {}).get(week.id, {})
+    if batch["frozen"] and closed.get("deadline") == stamp(effective.evidence_cutoff) and pointer.exists():
+        latest = latest_path(store, week.id)
+        if not config["scheduler"]["publish"] or (latest.parent / "publication.json").exists():
+            state.setdefault("finalization", {})[week.id] = {
+                "deadline": stamp(effective.finalize_at),
+                "status": "completed"
+                if release_path.with_name("final.json").exists()
+                else "deadline_passed"
+                if now >= effective.finalize_at
+                else "pending",
+            }
+            return
+    if hydrate:
+        hydrate(store, batch)
+    require_budget()
+    if batch["kind"] in {"bootstrap", "qualification"} and not batch["frozen"]:
+        incomplete = not batch["scan_complete"] or any(
+            status not in {"collected", "rejected"} for status, _ in batch["event_states"]
+        )
+        if incomplete:
+            with open_source(store, config, week.id, "V1", clock=clock, stop_at=stop_at) as pm:
+                result = Pipeline(store, pm, clock=clock).collect(
+                    week.id, batch["kind"], config["config_hash"], progress=log, refresh_completed=False
+                )
+                log(result)
+                if result.get("yielded"):
+                    raise WorkYield("runner_work_budget")
+                if not result["construction_complete"]:
+                    raise ValueError("construction_incomplete")
+    now = clock()
+    require_budget()
     pointer_missing = not (store.root / "batches" / week.id / "latest.json").exists()
-    if (not batch["frozen"] or pointer_missing) and now >= week.freeze_at:
+    if (not batch["frozen"] or pointer_missing) and (
+        now >= week.freeze_at or batch["kind"] in {"bootstrap", "qualification"}
+    ):
         manifest = store.freeze(week, now)
         log({"phase": "freeze", "batch_id": week.id, "counts": manifest["counts"]})
         batch["frozen"] = True
@@ -164,6 +295,7 @@ def advance_batch(store: Store, config: Record, batch: Record, now: datetime, st
     release_path = store.root / "batches" / week.id / "benchmark" / "release.json"
     if release_path.exists():
         week = Week.restore(read_manifest(release_path)["protocol"])
+    require_budget()
     if config["scheduler"]["publish"]:
         manifest_path = latest_path(store, week.id)
         if not (manifest_path.parent / "publication.json").exists():
@@ -177,10 +309,14 @@ def advance_batch(store: Store, config: Record, batch: Record, now: datetime, st
         else:
             last = state["last_refresh"].get(week.id)
             if last is None or (now - instant(last)).total_seconds() >= config["scheduler"]["poll_seconds"]:
-                with open_source(store, config, week.id, "V3") as pm:
-                    log(Pipeline(store, pm, clock=lambda: datetime.now(UTC)).refresh(week.id, progress=log))
-                state["last_refresh"][week.id] = stamp(datetime.now(UTC))
-            store.release_results(week, datetime.now(UTC))
+                with open_source(store, config, week.id, "V3", clock=clock, stop_at=stop_at) as pm:
+                    refresh = Pipeline(store, pm, clock=clock).refresh(week.id, progress=log, resume=True)
+                    log(refresh)
+                if refresh.get("yielded"):
+                    raise WorkYield("runner_work_budget")
+                state["last_refresh"][week.id] = stamp(clock())
+            require_budget()
+            store.release_results(week, clock())
         state.setdefault("finalization", {})[week.id] = {
             "deadline": stamp(week.finalize_at),
             "status": "completed"
@@ -189,6 +325,7 @@ def advance_batch(store: Store, config: Record, batch: Record, now: datetime, st
             if now >= week.finalize_at
             else "pending",
         }
+    require_budget()
     if config["scheduler"]["publish"]:
         manifest_path = latest_path(store, week.id)
         if not (manifest_path.parent / "publication.json").exists():
@@ -201,6 +338,12 @@ def parser() -> argparse.ArgumentParser:
     cli.add_argument("--qualification", action="store_true", help="使用隔离的工程核验数据目录")
     cli.add_argument("--bootstrap", action="store_true", help="完整初始源数据：实际观察与冻结时间，不倒填正式周批")
     commands = cli.add_subparsers(dest="command", required=True)
+    download = commands.add_parser("download-view", help="从HF分片按需导出累计JSONL，不依赖本地采集状态")
+    download.add_argument("--repo", required=True)
+    download.add_argument("--revision", default="main")
+    download.add_argument("--format", choices=["basic", "extended"], default="basic")
+    download.add_argument("--view", choices=["full", "balanced"], default="full")
+    download.add_argument("--output", type=Path, required=True)
     for command in (
         "collect",
         "freeze",
@@ -242,6 +385,13 @@ def parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = parser().parse_args()
+    if args.command == "download-view":
+        try:
+            log(download_view(args.repo, args.output, revision=args.revision, format=args.format, view=args.view))
+        except Exception as error:
+            print(dumps({"error": f"{type(error).__name__}:{error}"}), file=sys.stderr)
+            raise SystemExit(1) from error
+        return
     config = settings(args.config, args.qualification)
     if args.command in {"run", "tick"}:
         if args.qualification:

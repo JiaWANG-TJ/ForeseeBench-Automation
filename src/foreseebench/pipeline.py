@@ -28,8 +28,8 @@ from .contract import (
     source_binding,
     stamp,
 )
-from .source import EvidenceError, Page, Polymarket, evidence_observations
-from .store import Store, file_hash, read_manifest, read_records
+from .source import EvidenceError, Page, Polymarket, WorkYield, evidence_observations
+from .store import Store, atomic_json, file_hash, read_manifest, read_records
 
 
 def source_metadata(raw: Record, receipt: Record, week: Week) -> Record:
@@ -212,9 +212,17 @@ class Pipeline:
         self.store.begin(week, kind, config_hash)
         self.store.mutable(week.id)
         deadline = week.freeze_at if kind in {"formal", "bootstrap"} else None
+        yielded = False
         if (kind == "formal" and refresh_completed) or not self.store.batch(week.id)["scan_complete"]:
             try:
                 self._discover_source(week, deadline, kind == "formal" and refresh_completed, progress)
+            except WorkYield:
+                return self.store.batch(week.id) | {
+                    "construction_complete": False,
+                    "yielded": True,
+                    "event_states": self.store.event_counts(week.id),
+                    "source_coverage": self.store.source_coverage(week.id),
+                }
             except Exception as error:
                 self.store.failure(week.id, None, "discovery", self.clock(), f"{type(error).__name__}:{error}")
                 raise
@@ -228,6 +236,9 @@ class Pipeline:
         collected = states.get("collected", 0) if not refresh_all else 0
         if max_events is not None:
             for entry in pending:
+                if self.pm.work_expired:
+                    yielded = True
+                    break
                 if collected >= max_events:
                     break
                 collected += self._collect_event(entry, week, deadline, kind)
@@ -259,7 +270,7 @@ class Pipeline:
                                     **self.store.event_status(week.id, event_id),
                                 }
                             )
-                        next_entry = next(pending, None)
+                        next_entry = next(pending, None) if not self.pm.work_expired else None
                         if next_entry is not None:
                             futures[pool.submit(self._collect_event, next_entry, week, deadline, kind)] = next_entry[
                                 "event_id"
@@ -269,7 +280,9 @@ class Pipeline:
             "collected": states.get("collected", 0),
             "event_states": states,
             "source_coverage": self.store.source_coverage(week.id),
-            "construction_complete": not any(states.get(s, 0) for s in ("candidate", "collecting", "failed")),
+            "construction_complete": self.store.batch(week.id)["scan_complete"]
+            and not any(states.get(s, 0) for s in ("candidate", "collecting", "failed")),
+            "yielded": yielded or self.pm.work_expired,
         }
 
     def _discover_source(
@@ -281,6 +294,8 @@ class Pipeline:
         source_count = 0
         source_pass = None
         for page in self.pm.discover(week, deadline=deadline, refresh=refresh):
+            if page.rows:
+                self.pm.require_budget()
             if source_pass is None:
                 source_pass = self.pm.discovery_status()["boundary_receipt"]["request_id"]
             entries: list[Record] = []
@@ -323,6 +338,7 @@ class Pipeline:
             return False
         source = entry["payload"]
         try:
+            self.pm.require_budget()
             raw, receipt = self.pm.event(event_id, deadline=deadline)
             try:
                 current = admit_event(raw, week, instant(receipt["observed_at"]))
@@ -405,17 +421,23 @@ class Pipeline:
             final_source["native_unresolved_verified"] = True
             self.store.event(week.id, event_id, final_source, "collected")
             return True
+        except WorkYield:
+            return False
         except Exception as error:
             reason = f"{type(error).__name__}:{error}"
-            self.store.failure(week.id, event_id, "V1", self.clock(), reason)
             known = isinstance(error, EvidenceError) and has_known_answer(source, *error.partial[:2])
+            if isinstance(error, EvidenceError) and isinstance(error.cause, WorkYield) and not known:
+                return False
+            self.store.failure(week.id, event_id, "V1", self.clock(), reason)
             if known:
                 reason = "market_resolved_during_collection"
             status = "rejected" if known or str(error) == "market_resolved_during_collection" else "failed"
             self.store.event(week.id, event_id, source, status, reason)
             return False
 
-    def refresh(self, week_id: str, *, progress: Callable[[Record], None] | None = None) -> Record:
+    def refresh(
+        self, week_id: str, *, progress: Callable[[Record], None] | None = None, resume: bool = False
+    ) -> Record:
         week = self.store.week(week_id)
         if week.policy.read_only:
             raise ValueError("legacy_batch_read_only")
@@ -424,10 +446,26 @@ class Pipeline:
         release_path = self.store.root / "batches" / week_id / "benchmark" / "release.json"
         if release_path.exists():
             week = Week.restore(read_manifest(release_path)["protocol"])
-        updated, failed = 0, []
+        updated = 0
+        failed: list[Record] = []
+        cursor_path = self.store.root / "batches" / week_id / "refresh-cursor.json"
+        cursor = read_manifest(cursor_path) if resume and cursor_path.exists() else {}
+        after = cursor.get("after_event_id")
+        ready = after is None
+
+        def advance(event_id: str | None) -> None:
+            if resume:
+                atomic_json(cursor_path, {"after_event_id": event_id})
+
         for source in read_records(self.store.root, base, "events"):
+            if not ready:
+                ready = source["event_id"] == after
+                continue
+            if getattr(self.pm, "work_expired", False):
+                return {"batch_id": week_id, "updated": updated, "failures": failed, "yielded": True}
             previous = self.store.latest_resolution(week_id, source["event_id"])
             if previous and previous["status"] == "verified" and previous.get("validity") in {"valid", "invalid"}:
+                advance(source["event_id"])
                 continue
             observed = self.clock()
             fetch_error: Exception | None = None
@@ -454,21 +492,30 @@ class Pipeline:
                 fetch_error = error
                 observed = self.clock()
                 result = settle_event(source, [], [], week, observed, previous=previous)
-            if fetch_error is not None:
+            yielded = isinstance(fetch_error, WorkYield) or (
+                isinstance(fetch_error, EvidenceError) and isinstance(fetch_error.cause, WorkYield)
+            )
+            if fetch_error is not None and not yielded:
                 message = f"{type(fetch_error).__name__}:{fetch_error}"
                 self.store.failure(week_id, source["event_id"], "V3", self.clock(), message)
                 failed.append({"event_id": source["event_id"], "error": message})
             if "protocol" not in base:
                 result.update(validity="not_evaluated", eligibility="legacy_source_only", time=source["time"])
-            if previous and instant(previous["observed_at"]) > observed:
-                continue
-            if previous and fact_content(previous) == fact_content(result):
-                continue
-            self.store.add_resolution(week_id, result)
-            updated += 1
-            if progress:
-                progress({"phase": "resolve", "updated": updated, "failed": len(failed)})
-        return {"batch_id": week_id, "updated": updated, "failures": failed}
+            changed = not previous or (
+                instant(previous["observed_at"]) <= observed and fact_content(previous) != fact_content(result)
+            )
+            if changed:
+                self.store.add_resolution(week_id, result)
+                updated += 1
+                if progress:
+                    progress({"phase": "resolve", "updated": updated, "failed": len(failed)})
+            if yielded:
+                return {"batch_id": week_id, "updated": updated, "failures": failed, "yielded": True}
+            advance(source["event_id"])
+        if not ready:
+            raise ValueError("refresh_cursor_not_in_frozen_snapshot")
+        advance(None)
+        return {"batch_id": week_id, "updated": updated, "failures": failed, "yielded": False}
 
 
 def stage_task(store: Store, stage: str, manifest_path: str, *, v2_task_id: str | None = None) -> Record:

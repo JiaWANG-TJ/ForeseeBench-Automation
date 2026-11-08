@@ -42,15 +42,6 @@ class Policy:
             raise ValueError("invalid_protocol_duration")
         if self.legacy_gt_grace_hours is not None and self.legacy_gt_grace_hours <= 0:
             raise ValueError("invalid_legacy_grace_period")
-        cycle_hours = (
-            self.publish_offset_hours
-            - self.collection_start_offset_hours
-            + self.submission_hours
-            + self.ending_window_days * 24
-            + self.finalization_hours
-        )
-        if self.legacy_gt_grace_hours is None and cycle_hours >= 12 * 24:
-            raise ValueError("cycle_must_be_shorter_than_12_days")
 
     @property
     def read_only(self) -> bool:
@@ -167,7 +158,6 @@ class Week:
         )
 
     def record(self) -> Record:
-        self.require_cycle_budget()
         record = {
             "protocol_version": "2.0" if self.policy.legacy_gt_grace_hours is not None else "3.0",
             "batch_id": self.id,
@@ -233,10 +223,6 @@ class Week:
     @property
     def finalize_at(self) -> datetime:
         return self.evidence_cutoff + timedelta(hours=self.policy.finalization_hours)
-
-    def require_cycle_budget(self) -> None:
-        if self.policy.legacy_gt_grace_hours is None and self.finalize_at - self.collection_start >= timedelta(days=12):
-            raise ValueError("publication_misses_cycle_budget")
 
 
 def scheduled_end(source: Record) -> datetime:

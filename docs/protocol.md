@@ -1,6 +1,6 @@
 # ForeseeBench 执行协议
 
-本文件记录用户确认的最终采集范围。原始 `文档/数据收集1104.md` 和 `文档/Future Prediction Benchmark.pdf` 保持原样。
+本文件记录现行采集与执行规则，需求摘要同步在`文档/数据收集1104.md`。原始研究资料保留在私有开发仓库；旧规则不覆盖这里已确认的修订。
 
 ## 术语与边界
 
@@ -15,23 +15,23 @@
 
 ## UTC 时间规则（协议 3.0）
 
-时间沿用用户确认的三天作答、五天回收，前后各预留一天，名义总周期十天。2026-11-08修订数据范围：全部合规数据保存并发布，另提供每域最多200个Event的采样视图；500—1000及领域数量是分析关注值，不是生产验收门槛。历史来源分析见[时间窗核验报告](polymarket_timing_audit.md)。全部参数来自 `foreseebench.toml`，创建批次时冻结到 `protocol.json` 和V1清单。旧输入与哈希保留，只读核验、导出和格式投影，不继续旧周期采集或回收。
+时间沿用三天作答、五天回收，前后各预留一天，名义总周期十天；不另设十二天周期或总时长上限。全部合规数据保存并发布，另提供每域最多200个Event的采样视图；500—1000及领域数量仅作分析。全部参数来自`foreseebench.toml`，创建批次时冻结到`protocol.json`和V1清单。本次获授权退役的历史API数据按清理记录删除，新周期完全重新采集；之后的新冻结输入和结果继续保留必要原件及版本，不混入旧历史投影。
 
 正常周批周一17:00开始准备，周二11:00截止读取特征并冻结，预留六小时构题与核验，周二17:00发题。周ID仍使用UTC周一日期。`startDate`、`createdAt`和`gameStartTime`仅作来源信息，不作为准入条件；缺失或无法解析的可选开始时间归一化为null，原值留在HTTP归档中。正式日期准入只检查全部冻结Market.endDate。
 
 - 用户提交截止为**实际正式发布后 72 小时**；迟到发布必须重新核验日期和未决状态。
 - 全部 Market 必须满足 `提交截止 < Market.endDate <= 提交截止 + 5天`。任何一个 Market 不满足即整 Event 排除，不截取子集。
 - 所有Market指本批冻结时的完整成员集合。发布前发现结构变化时整Event排除；发布后新增成员另行保留在新来源观察中，不修改已经发布的分母。
-- `time.end_at = max(全部冻结 Market.endDate)`，在 V1 即填写，并统一用于 Parquet 与两份 JSONL。GT 回填不修改该计划日期。
+- `time.end_at = max(全部冻结 Market.endDate)`，在V1即填写，并统一用于Parquet和四种读取视图。GT回填不修改该计划日期。
 - 全批共用 `gt_deadline_at = submission_deadline + 120小时`，不再逐Event额外延长48小时。到该时刻停止请求GT；尚缺合格结果的Event完整保留并失效。
-- `finalize_at = gt_deadline_at + 24小时`，保留V4和评估处理预算。实际发布时间发生延迟时重新检查完整72小时与五天窗口；预计全周期达到或超过12天时拒绝发布。
+- `finalize_at = gt_deadline_at + 24小时`，保留V4和评估处理预算。实际发布时间发生延迟时重新检查完整72小时与五天窗口。
 - 每周继续构建新批次，相邻批次可并行。只有正式题集中的Event消耗发布资格；进入原始库、V1或候选预选不消耗资格。正式发布清单是去重索引的事实来源，崩溃后可据此恢复。
 
 例如2026-11-09 17:00开始准备，11-10 11:00冻结、17:00发布，11-13 17:00截止提交；每个Market.endDate在`(2026-11-13 17:00, 2026-11-18 17:00]`。11-18 17:00结束回收，11-19 17:00为后处理期限。截止前答案已经可确定的Event及其全部QA对所有参与者统一失效。
 
 API 是分次观察，`observed_at` 表示实际获取时间，不能宣称多个接口提供原子时点快照。V2 语义审核必须核对目标在提交前不可确定，以及依据完整 PM 结算结果构造答案的规则；本轮不实现这一 LLM 处理器，也不会用 `closed=false` 代替其审核。
 
-服务错过采集窗口时不倒填正式V1。`bootstrap`使用含真实创建时刻的独立批次ID，从启动时刻预留18小时采集、24小时到计划发布，并记录实际冻结时间和`schedule_compliant=false`；其真实采集起点独立保存，不因提前冻结而被倒推。发布时同样重核72小时、五天及全周期预算。旧批次ID不覆盖。`qualification`仅作隔离工程核验。
+服务错过采集窗口时不倒填正式V1。`bootstrap`使用含真实创建时刻的独立批次ID，从启动时刻预留18小时采集、24小时到计划发布；在采集完整后可提前冻结，并记录真实冻结时间和`schedule_compliant=false`。启动时间不因提前冻结而倒推；发布时重核72小时与五天窗口。18小时截止仍不完整时记录`expired_incomplete`并停止该批次后续请求，不能延长旧截止或冒充完整产品；后续正式周批继续。`qualification`仅作隔离工程核验。
 正式采集完成后等待周二11:00冻结；显式再次collect会重新枚举当前源池及刷新已完成流。新扫描开始即撤销旧完成标记，失败不能沿用上次完成状态。此前存在、后来不可读取的Event保留旧事实及明确排除原因；重新变得合格时完整重采评论与成交。
 
 ## 全量源库与分域选取
@@ -85,7 +85,7 @@ tags缺失/null保留为domain=null，真实空标签列表才是[]；非筛选�
 
 ## 存储与接口
 
-单进程通过文件锁持有 DuckDB 写入权；消费端读取不可变 Parquet。部署在共享 GPFS 时仍限定一个写入进程。
+单进程通过文件锁持有DuckDB写入权，消费端读取不可变Parquet。生产由公开GitHub仓库的标准Ubuntu runner执行，使用单一并发组；数据库只在runner本地盘运行，不直接放在对象存储挂载上。
 网络采用8个有界worker并共享每秒5次限速；DuckDB使用独立读取cursor和串行事务锁，SQLite归档也串行提交。全域来源与候选任务均有界流式处理；限速等待后再次检查截止，禁止等待跨截止后仍发请求。准入统一执行提交截止的开边界和五天结束窗口的闭边界。
 HTTPX客户端按worker隔离；网络错误后先保留错误回执，再回收该worker的客户端并重试，避免代理TLS失败耗尽连接池。其他worker的连接不受回收影响。该路径已用本地CONNECT/TLS失败复现及回归核验，参见[httpcore上游问题](https://github.com/encode/httpcore/discussions/921)。
 四类 Parquet 为 events、comments、trades、resolutions；Market 结构内嵌在 events，评论和成交只按 Event 保存一次。
@@ -97,8 +97,8 @@ HTTPX客户端按worker隔离；网络错误后先保留错误回执，再回收
 HF 使用预上传和一次 create_commit；parent_commit 检测并发冲突。首次V3发布同时提交V1父清单及全部引用文件。
 远端绑定每周V1输入哈希，其他数据目录也不能覆盖既有冻结输入；只允许添加新的结算快照。未验证完成的本地快照不得发布。
 
-每次发布生成`full/basic.jsonl`、`full/extended.jsonl`、`balanced/basic.jsonl`、`balanced/extended.jsonl`和`statistics.json`，在一次HF提交中更新并按不可变commit回读核对哈希。旧的根目录两份JSONL别名退出当前HEAD，历史提交和原始快照不删除。
-JSONL 3.0以`source_id`标识原始Event，`qa_id`仅用于未来构造题；`title`保留原始Event标题，`slug`按冻结`source_hash`从原件读取。主字段为身份、原始标签、冻结的主领域、时间、单份`markets`结构与`native_gt`；详细回执和重复观察字段留在审计归档。具体字段见[数据契约](data_contract.md)。
+四种视图改为`<view>/<format>/<partition>/<content-hash>.jsonl`分片；view为full/balanced，format为basic/extended。source_id的SHA-256首个十六进制字符确定16个稳定分区，目标分片128MiB，超大Event独占分片而不截断。清单精确列出当前有效分片，更新仅重写受影响分区；`statistics.json`继续保存完整统计。新/变化对象在不可变commit实际回读校验，复用对象核对同一commit的LFS SHA-256或已记录Git blob身份。首次回读中断时重试仍须完成该次新增对象的实读，不能仅因commit存在就跳过。用户可用`download-view`固定远端提交并逐片核验，按原字节合成累计JSONL；无需本地管线数据库。
+JSONL行结构仍为3.0，以`source_id`标识原始Event，`qa_id`仅用于未来构造题。`source-metadata.json`在V1冻结时保存经原件核验的轻量来源摘要并绑定原归档哈希，供后续导出读取；它不替代完整原件。主字段为身份、原始标签、冻结的主领域、时间、单份`markets`结构与`native_gt`，详细回执留在审计归档。具体字段见[数据契约](data_contract.md)。
 扩展版增加Event描述、每个Market的完整规则描述与结算来源、评论树、缺父回复和逐笔成交。相同文字若分别属于Event与Market，仍保留各自真实含义；不把缺失Market规则用Event描述补写。评论树不删节点或重复成交；循环关系拒绝导出。
 累计视图每个Event选取一份完整快照：正式发题绑定优先，否则取最新冻结快照。采样视图取这些相同快照的冻结名单子集；每批原始名单和全部Parquet、归档仍保留。输入、评论、成交与GT不跨快照拼接。数量校验包括评论各层回复、缺父子树和逐笔成交重数。
 V1导出`native_gt=null`；latest合并V3。结果流按Event ID与来源流对齐，不把整批详细取证JSON同时读入内存。原始source_id/event_id保持唯一，重复标题不会合并。来源哈希、文本或绑定不一致时拒绝导出。
@@ -114,6 +114,18 @@ V2 JSONL 每个源 Event 一行，必须完整覆盖 V1 分母，包括不合格
 V4必须绑定已发布V2及同批V3，逐QA输出`qa_id,event_id,source_id,groundtruth,validity`并覆盖全部发布分母。原生有效／失效状态已确定且真实V4 validator通过后，`benchmark-finalize`保存完整结果，状态为completed，并分别统计有效、失效、领域和处理时间；不再添加规模或领域数量的通过／不通过结论。
 官方结算晚于提交截止不代表真实世界答案也晚于截止。V4 语义审核发现提前可知或题目无效时，必须给出 `invalid_reason=early_information/invalid_question` 及 `evidence_urls`，把整个 Event 的所有 QA 统一降为失效；不能把原生失效 Event 升回有效。
 当前未注册真实处理器，两阶段均不执行构题或语义验证，不能进入正式预测评分。原生 V3 更新、未来 GT 等待与 LLM 阶段状态单独报告。
+
+## 托管执行、恢复与资源边界
+
+公开运行仓库为`JiaWANG-TJ/ForeseeBench-Automation`，私有开发仓库保留历史。GitHub每五分钟触发`cloud.yml`，调度可能延迟或漏跑；程序根据真实UTC时刻和批次状态恢复。一次处理最多2700秒，检查点宽限600秒，job硬超时3600秒。正式截止优先于执行预算；预算到期只交接检查点，不把未完成批次标成完整。GT和到期阶段优先于新采集，避免长扫描阻塞旧批次关闭。
+
+`SII-JiaWANG/ForeseeBench-state`私有Bucket保存内容哈希对象、代次清单和最后提交的`completed.json`指针。上传前关闭数据库，逐对象回读并记录内容身份；只在整代完整后提交指针。恢复先读取控制文件，再按阶段加载所需输入。未下载的冻结证据只有在原SHA验证记录及当前Xet身份、大小一致时才能远端核验；已下载文件仍检查SHA，使用的Parquet仍检查行数。不把存在或大小当成完整性证明。
+
+保留最近两代完成的工作检查点，回收未被任何保留代次引用的中间对象；规范输入、结果和必要证据不因清理缓存而丢失。`publication.json`必须进入检查点，以区分首次回读未完成和已经核验的发布。免费存储预算不足或用量无法核验时停止新增写入，保持最后完整代次并报告，不自动付费或删除正式数据。
+
+生产开关为GitHub仓库变量`FORESEEBENCH_ENABLED`；工程核验在独立Bucket前缀运行，不写正式Dataset。每天或阶段发生变化时仅把不含GT、原文和密钥的汇总状态写入`automation/status.json`。HF Dataset负责数据发布，Bucket负责工作状态；两者都不会自行执行此工作流。
+
+统一LLM客户端在`foreseebench.llm`，验证HTTP状态、模型身份、完整停止、非空最终内容和JSON Schema，思考文本与最终内容分别保存。密钥仅从环境或GitHub Secrets读取。启智临时服务使用“公共科研项目”，实际权重为指定DeepSeek-V4.1-Flash-1017全局路径；平台选择项仅作登记关联。测试覆盖普通回答、JSON和思考模式，并从外部runner验证；无论测试结果如何，都下线此次创建的服务。后续四类业务处理器仍不启用，GPU卡时与GitHub免费CPU执行分别核算。
 
 置信度评价不需要另一个`gt_confidence`：未来判分器依据构造题参考答案产生`correct=0/1`，再计算`(confidence-correct)^2`。该标签属于具体提交答案，不是所有题固定填1。Forecast-Dojo使用完整选项分布的多分类Brier；OpenForecaster的开放答案分数为`2*correct*confidence-confidence^2`，其均值等于ACC减去上述置信度Brier loss。这里只记录数据与接口契约，不实施LLM判分或冒充已经得到模型指标。[Forecast-Dojo源码](https://github.com/Forecast-Dojo/Forecast-Dojo/blob/877f377593978eedec7476c83221fac79c78f8c4/src/evaluation/metrics.py#L44-L75)、[OpenForecaster论文](https://arxiv.org/html/2512.25070v1#S3)。
 
