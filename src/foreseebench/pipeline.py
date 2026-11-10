@@ -291,13 +291,25 @@ class Pipeline:
         """完整归档后筛选；枚举失败与Event排除分别保留。"""
         self.store.discovery_started(week.id)
         protected = self.store.known_answer_ids(week.id)
-        source_count = 0
-        source_pass = None
-        for page in self.pm.discover(week, deadline=deadline, refresh=refresh):
+        coverage = self.pm.discovery_status()
+        source_pass = coverage.get("boundary_receipt", {}).get("request_id")
+        if refresh and coverage.get("complete"):
+            source_pass = None
+        replay = (
+            self.store.source_replay(week.id, source_pass)
+            if source_pass is not None
+            else {"request_id": None, "source_count": 0}
+        )
+        source_count = replay["source_count"]
+        for page in self.pm.discover(
+            week, deadline=deadline, refresh=refresh, after_request_id=replay["request_id"]
+        ):
             if page.rows:
                 self.pm.require_budget()
+            if source_pass is None or not coverage.get("complete"):
+                coverage = self.pm.discovery_status()
             if source_pass is None:
-                source_pass = self.pm.discovery_status()["boundary_receipt"]["request_id"]
+                source_pass = coverage["boundary_receipt"]["request_id"]
             entries: list[Record] = []
             seen_ids = []
             for raw in page.rows:
@@ -322,9 +334,15 @@ class Pipeline:
                     source.update(source_metadata(raw, page.receipt, week))
                 entries.append({"event_id": event_id, "payload": source, "status": status, "reason": reason})
             if entries or seen_ids:
-                self.store.source_page(week.id, entries, seen_ids=seen_ids, source_pass=source_pass)
+                self.store.source_page(
+                    week.id,
+                    entries,
+                    seen_ids=seen_ids,
+                    source_pass=source_pass,
+                    receipt_id=page.receipt["request_id"],
+                )
             if progress:
-                progress({"phase": "discover", "source_events": source_count, **self.pm.discovery_status()})
+                progress({"phase": "discover", "source_events": source_count, **coverage})
         coverage = self.pm.discovery_status()
         if source_count != coverage["events"]:
             raise ValueError("source_catalog_count_mismatch")

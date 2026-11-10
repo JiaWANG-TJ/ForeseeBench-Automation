@@ -226,10 +226,17 @@ class AuditArchive:
                     raise ValueError("source_body_checksum_mismatch")
             yield Page(spool, prefix, receipt)
 
-    def source_pages(self) -> Iterator[DiscoveryPage]:
+    def source_pages(self, *, after_request_id: str | None = None) -> Iterator[DiscoveryPage]:
         with self.lock:
+            if after_request_id is not None and not self.db.execute(
+                "SELECT 1 FROM source_events WHERE request_id=? LIMIT 1", [after_request_id]
+            ).fetchone():
+                raise ValueError("source_replay_receipt_missing")
             pages = self.db.execute(
-                "SELECT DISTINCT request_id,prefix FROM source_events ORDER BY request_id"
+                "SELECT DISTINCT request_id,prefix FROM source_events"
+                + (" WHERE request_id>?" if after_request_id is not None else "")
+                + " ORDER BY request_id",
+                [after_request_id] if after_request_id is not None else [],
             ).fetchall()
         for request_id, prefix in pages:
             with self.lock:
@@ -501,7 +508,12 @@ class Polymarket:
         return self.archive.source_coverage()
 
     def discover(
-        self, week: Week, *, deadline: datetime | None = None, refresh: bool = False
+        self,
+        week: Week,
+        *,
+        deadline: datetime | None = None,
+        refresh: bool = False,
+        after_request_id: str | None = None,
     ) -> Iterator[DiscoveryPage]:
         """先完整保存双版本、全状态来源；所有日期与领域筛选留给下游。"""
         fingerprint = digest([self.gamma_url, "positive_event_id_census_v1", ["v1", "v2"], "any"])
@@ -509,6 +521,7 @@ class Polymarket:
         if scan and scan["fingerprint"] != fingerprint:
             raise ValueError("source_scan_configuration_changed")
         if scan is None or refresh and self.discovery_status()["complete"]:
+            after_request_id = None
             params = {"limit": 1, "closed": "any", "version": ["v1", "v2"], "order": "id", "ascending": "false"}
             with self.page("/events/keyset", params, "events.item", deadline=deadline) as page:
                 page.require_array("events")
@@ -571,7 +584,7 @@ class Polymarket:
                 stop.set()
         if not self.discovery_status()["complete"]:
             raise ValueError("source_discovery_incomplete")
-        yield from self.archive.source_pages()
+        yield from self.archive.source_pages(after_request_id=after_request_id)
 
     def _discover_id_range(self, lower: int, upper: int, deadline: datetime | None) -> None:
         identifiers = set(range(lower, upper + 1))

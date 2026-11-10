@@ -269,6 +269,9 @@ class Store:
               batch VARCHAR, event_id VARCHAR, phase VARCHAR, observed_at VARCHAR, error VARCHAR);
             CREATE TABLE IF NOT EXISTS published_events (event_id VARCHAR PRIMARY KEY, batch VARCHAR);
             CREATE TABLE IF NOT EXISTS published_batches (batch VARCHAR PRIMARY KEY, release_sha256 VARCHAR);
+            CREATE TABLE IF NOT EXISTS source_replays (
+              batch VARCHAR, source_pass VARCHAR, request_id VARCHAR, source_count BIGINT,
+              PRIMARY KEY(batch, source_pass));
         """)
         self.db.execute("ALTER TABLE events ADD COLUMN IF NOT EXISTS source_pass VARCHAR")
 
@@ -430,32 +433,68 @@ class Store:
 
     @serialized
     def source_page(
-        self, batch_id: str, entries: list[Record], *, seen_ids: list[str] | None = None, source_pass: str | None = None
+        self,
+        batch_id: str,
+        entries: list[Record],
+        *,
+        seen_ids: list[str] | None = None,
+        source_pass: str | None = None,
+        receipt_id: str | None = None,
     ) -> None:
         self.mutable(batch_id)
+        registered = False
         self.db.execute("BEGIN TRANSACTION")
         try:
             if entries:
-                self.db.executemany(
-                    """INSERT INTO events(batch,event_id,payload,status,reason) VALUES (?,?,?,?,?)
+                incoming = pa.table(
+                    {
+                        "event_id": pa.array([row["event_id"] for row in entries], type=pa.string()),
+                        "payload": pa.array([dumps(row["payload"]) for row in entries], type=pa.string()),
+                        "status": pa.array([row["status"] for row in entries], type=pa.string()),
+                        "reason": pa.array([row["reason"] for row in entries], type=pa.string()),
+                    }
+                )
+                self.db.register("source_page_entries", incoming)
+                registered = True
+                self.db.execute(
+                    """INSERT INTO events(batch,event_id,payload,status,reason)
+                    SELECT ?,event_id,payload::JSON,status,reason FROM source_page_entries
                     ON CONFLICT(batch,event_id) DO UPDATE SET
                     payload=excluded.payload,status=excluded.status,reason=excluded.reason""",
-                    [
-                        (batch_id, row["event_id"], dumps(row["payload"]), row["status"], row["reason"])
-                        for row in entries
-                    ],
+                    [batch_id],
                 )
             if seen_ids:
                 self.db.execute(
-                    "UPDATE events SET source_pass=? WHERE batch=? AND event_id IN ("
-                    + ",".join("?" for _ in seen_ids)
-                    + ")",
-                    [source_pass, batch_id, *seen_ids],
+                    "UPDATE events SET source_pass=? WHERE batch=? AND event_id IN (SELECT unnest(?::VARCHAR[]))",
+                    [source_pass, batch_id, seen_ids],
+                )
+            if receipt_id is not None:
+                if source_pass is None or seen_ids is None:
+                    raise ValueError("source_replay_identity_missing")
+                previous = self.source_replay(batch_id, source_pass)
+                if previous["request_id"] is not None and receipt_id <= previous["request_id"]:
+                    raise ValueError("source_replay_out_of_order")
+                self.db.execute(
+                    """INSERT INTO source_replays VALUES (?,?,?,?)
+                    ON CONFLICT(batch,source_pass) DO UPDATE SET
+                    request_id=excluded.request_id,source_count=excluded.source_count""",
+                    [batch_id, source_pass, receipt_id, previous["source_count"] + len(seen_ids)],
                 )
             self.db.execute("COMMIT")
         except Exception:
             self.db.execute("ROLLBACK")
             raise
+        finally:
+            if registered:
+                self.db.unregister("source_page_entries")
+
+    @serialized
+    def source_replay(self, batch_id: str, source_pass: str) -> Record:
+        row = self.db.execute(
+            "SELECT request_id,source_count FROM source_replays WHERE batch=? AND source_pass=?",
+            [batch_id, source_pass],
+        ).fetchone()
+        return {"request_id": row[0], "source_count": row[1]} if row else {"request_id": None, "source_count": 0}
 
     def iter_events(self, batch_id: str, statuses: tuple[str, ...] | None = None) -> Iterator[Record]:
         query = "SELECT event_id,payload,status,reason FROM events WHERE batch=?"
