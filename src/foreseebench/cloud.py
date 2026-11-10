@@ -552,6 +552,7 @@ def main() -> None:
     parser.add_argument("--work-seconds", type=int, default=2700)
     parser.add_argument("--checkpoint-seconds", type=int, default=600)
     parser.add_argument("--status-output", type=Path, help="写出仅含日期、阶段与汇总计数的公开状态")
+    parser.add_argument("--receipt-output", type=Path, help="向监督进程写出本次运行与已确认检查点回执")
     args = parser.parse_args()
     if not 1 <= args.work_seconds <= 2700 or not 1 <= args.checkpoint_seconds <= 600:
         parser.error("工作预算须为 1—2700 秒，检查点宽限期须为 1—600 秒")
@@ -589,6 +590,8 @@ def main() -> None:
                 work_seconds=args.work_seconds,
             )
             log(receipt)
+            if args.receipt_output:
+                atomic_json(args.receipt_output, receipt)
             if args.status_output and not args.qualification:
                 atomic_json(args.status_output, receipt["status"])
             if receipt["errors"]:

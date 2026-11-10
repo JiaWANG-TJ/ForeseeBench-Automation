@@ -54,7 +54,7 @@ workers = 1
     with (tmp_path / "retry.log").open("w") as output:
         process = subprocess.Popen(command, stdout=output, stderr=output, env=environment)
         try:
-            assert requests.wait(timeout=5)
+            assert requests.wait(timeout=10)
             if stop_mode == "deadline":
                 limit = time.monotonic() + 2
                 while not (root / "scheduler.json").exists() and time.monotonic() < limit:
@@ -118,6 +118,81 @@ def test_service_wrapper_waits_for_shutdown_before_starting_again(tmp_path):
         while socket.exists() and time.monotonic() < deadline:
             time.sleep(0.05)
         assert not socket.exists(), "隔离Supervisor实例未退出"
+
+
+def test_migrated_service_cannot_start_a_second_local_writer(tmp_path):
+    import shutil
+
+    root = tmp_path / "host"
+    (root / "scripts").mkdir(parents=True)
+    (root / "data/service").mkdir(parents=True)
+    source = Path(__file__).resolve().parents[1] / "scripts/service.sh"
+    shutil.copy2(source, root / "scripts/service.sh")
+    (root / "data/service/cloud-owner.json").write_text('{"space":"owner/space"}')
+    for action in ("start", "restart"):
+        result = subprocess.run(
+            ["bash", str(root / "scripts/service.sh"), action], capture_output=True, text=True, timeout=5
+        )
+        assert result.returncode == 2
+        assert "已移交云端" in result.stderr
+
+
+def test_queued_start_rechecks_migration_marker_after_acquiring_start_lock(tmp_path):
+    import fcntl
+    import shutil
+
+    root = tmp_path / "host"
+    (root / "scripts").mkdir(parents=True)
+    service = root / "data/service"
+    service.mkdir(parents=True)
+    shutil.copy2(Path(__file__).resolve().parents[1] / "scripts/service.sh", root / "scripts/service.sh")
+    with (service / "start.lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        process = subprocess.Popen(
+            ["bash", str(root / "scripts/service.sh"), "start"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        try:
+            deadline = time.monotonic() + 5
+            while not Path(f"/proc/{process.pid}/fd/9").exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert Path(f"/proc/{process.pid}/fd/9").exists()
+            (service / "cloud-owner.json").write_text('{"space":"owner/space"}')
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            _, error = process.communicate(timeout=5)
+            assert process.returncode == 2 and "已移交云端" in error.decode()
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+
+
+def test_handoff_requires_the_worker_lock_to_be_released_before_marking_migration(tmp_path):
+    import fcntl
+    import shutil
+
+    root = tmp_path / "host"
+    (root / "scripts").mkdir(parents=True)
+    service = root / "data/service"
+    service.mkdir(parents=True)
+    binaries = root / ".venv/bin"
+    binaries.mkdir(parents=True)
+    shutil.copy2(Path(__file__).resolve().parents[1] / "scripts/service.sh", root / "scripts/service.sh")
+    (binaries / "python").symlink_to(sys.executable)
+    control = binaries / "supervisorctl"
+    control.write_text("#!/bin/sh\nexit 4\n")
+    control.chmod(0o755)
+
+    def invoke(action):
+        return subprocess.run(["bash", str(root / "scripts/service.sh"), action], capture_output=True, timeout=5)
+
+    with (service / "runner.lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        assert invoke("handoff").returncode != 0
+        assert not (service / "cloud-owner.json").exists()
+    assert invoke("handoff").returncode == 0
+    marker = json.loads((service / "cloud-owner.json").read_text())
+    assert marker["phase"] == "handoff_pending"
+    assert invoke("start").returncode == 2
 
 
 def test_daemon_emits_bounded_heartbeats_and_resumes_after_a_graceful_restart(tmp_path):

@@ -93,6 +93,7 @@ tags缺失/null保留为domain=null，真实空标签列表才是[]；非筛选�
 本机数据位于项目共享文件系统的`data/`，数据库事务、原始响应和范围检查点在资源回收后仍可恢复；已完成快照按既有规则发布HF，服务日志只保留有限轮转文件。HF认证存放在用户共享认证缓存，凭据不进入Git、数据快照或发布清单。设置`HF_BUCKET`后，本机发布复用云端90GB容量检查。启动前检查PM连接与HF可见容量；服务启动命令是`bash scripts/service.sh start`，资源重启后执行同一命令，或由平台启动后的命令钩子执行。监督进程不能在资源离线期间运行；错过冻结或GT截止时按已有失效规则记录，不能补造停机期间的观测。
 
 迁回云端时先停止本机写入者，再把关闭后的完整本地状态保存为已验证Bucket检查点，从新runner核验恢复后才开启云端生产，不能让两种部署同时写入。该迁移尚未执行。
+独立Space适配器复用同一管线，以单进程锁和远端租约防止重复执行；UptimeRobot仅访问健康接口。实际移交使用`service.sh handoff`，在启动锁内确认本机写入者退出并先写入迁移保护，再上传状态和启用云端。2026-11-10的免费Space资格未通过，新Space已暂停；当前仍为本机执行，尚未写入迁移标记。资格、恢复和观察要求见[Space说明](hf_space.md)及[验收记录](acceptance.md)。
 网络采用8个有界worker并共享每秒5次限速；DuckDB使用独立读取cursor和串行事务锁，SQLite归档也串行提交。全域来源与候选任务均有界流式处理；限速等待后再次检查截止，禁止等待跨截止后仍发请求。准入统一执行提交截止的开边界和五天结束窗口的闭边界。
 HTTPX客户端按worker隔离；网络错误后先保留错误回执，再回收该worker的客户端并重试，避免代理TLS失败耗尽连接池。其他worker的连接不受回收影响。该路径已用本地CONNECT/TLS失败复现及回归核验，参见[httpcore上游问题](https://github.com/encode/httpcore/discussions/921)。
 四类 Parquet 为 events、comments、trades、resolutions；Market 结构内嵌在 events，评论和成交只按 Event 保存一次。

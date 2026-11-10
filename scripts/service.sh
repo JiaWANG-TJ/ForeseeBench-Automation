@@ -20,11 +20,35 @@ control() {
 }
 
 case "$action" in
-  start|stop|restart)
+  start|stop|restart|handoff)
     exec 9>"$service_root/start.lock"
     flock --exclusive 9
     ;;
 esac
+
+if [[ -f "$service_root/cloud-owner.json" && ( "$action" == start || "$action" == restart ) ]]; then
+  printf '%s\n' '本项目已移交云端。恢复本机前须先停止云端并恢复最新检查点。' >&2
+  exit 2
+fi
+
+shutdown() {
+  if control pid >/dev/null 2>&1; then
+    control shutdown
+  fi
+  for ((attempt=0; attempt<1000; attempt++)); do
+    if [[ ! -S "$FORESEEBENCH_SOCKET" ]]; then
+      exec 8>"$service_root/runner.lock"
+      if ! flock --exclusive --nonblock 8; then
+        printf '%s\n' '本项目写入进程仍持有执行锁，不能确认停止。' >&2
+        return 1
+      fi
+      return 0
+    fi
+    sleep 0.1
+  done
+  printf '%s\n' 'Supervisor尚未完成停止，请检查本服务日志。' >&2
+  return 1
+}
 
 case "$action" in
   start)
@@ -62,15 +86,37 @@ PY
     control status foreseebench
     ;;
   stop)
-    control shutdown
-    for ((attempt=0; attempt<1000; attempt++)); do
-      if [[ ! -S "$FORESEEBENCH_SOCKET" ]]; then
-        exit 0
-      fi
-      sleep 0.1
-    done
-    printf '%s\n' 'Supervisor尚未完成停止，请检查本服务日志。' >&2
-    exit 1
+    shutdown
+    ;;
+  handoff)
+    shutdown
+    if [[ -f "$service_root/cloud-owner.json" ]]; then
+      printf '%s\n' '迁移保护已经生效，保留原有移交记录。'
+      exit 0
+    fi
+    "$FORESEEBENCH_ROOT/.venv/bin/python" - <<'PY'
+import json
+import os
+from datetime import datetime, timezone
+from pathlib import Path
+
+directory = Path(os.environ["FORESEEBENCH_ROOT"]) / "data/service"
+path = directory / "cloud-owner.json"
+temporary = path.with_suffix(".tmp")
+record = {"space": "SII-JiaWANG/ForeseeBench-Automation", "phase": "handoff_pending", "created_at": datetime.now(timezone.utc).isoformat()}
+with temporary.open("w") as stream:
+    json.dump(record, stream)
+    stream.write("\n")
+    stream.flush()
+    os.fsync(stream.fileno())
+os.replace(temporary, path)
+fd = os.open(directory, os.O_DIRECTORY)
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)
+print("本机写入者已停止，迁移保护已生效。")
+PY
     ;;
   restart)
     control restart foreseebench
@@ -80,7 +126,7 @@ PY
     tail -n 80 "$service_root/worker.log"
     ;;
   *)
-    printf '%s\n' '用法：bash scripts/service.sh {start|status|stop|restart|logs}' >&2
+    printf '%s\n' '用法：bash scripts/service.sh {start|status|stop|restart|handoff|logs}' >&2
     exit 2
     ;;
 esac

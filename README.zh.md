@@ -20,6 +20,8 @@ LLM构题、题目审核、构造题GT和答案判分仍是后续处理器。当
 
 当前暂时运行在用户已有计算资源上，GitHub分配runner仍受账户billing lock阻塞。两种部署复用同一采集代码；本机运行期间关闭GitHub生产开关。实际状态见[验收记录](docs/acceptance.md)。
 
+独立HF Space适配器和UptimeRobot激活客户端已经实现。11月10日实际启动时，ZeroGPU拒绝纯CPU应用；将新Space切换为CPU Basic又返回HTTP 402，要求PRO。新Space已暂停，监控与生产迁移均未开始。详见[Space部署说明](docs/hf_space.md)；当前账户的免费托管路径尚未通过验证。
+
 ```text
 GitHub托管CPU任务 -> Polymarket API
                  -> HF私有Bucket：可恢复工作状态

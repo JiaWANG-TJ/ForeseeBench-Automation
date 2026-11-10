@@ -1,0 +1,6 @@
+gradio[oauth,mcp]==6.31.0
+spaces==0.51.3
+websockets==17.4
+uvicorn==0.54.0
+huggingface-hub==2.4.0
+uv==0.13.7

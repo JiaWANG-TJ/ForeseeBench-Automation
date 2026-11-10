@@ -20,6 +20,8 @@ LLM question construction, question review, constructed-question GT, and answer 
 
 The current deployment temporarily runs on the owner's existing compute resource while GitHub runner allocation is blocked by an account billing lock. The same collection code supports both deployments; the GitHub production switch stays off during local operation. See the measured status in [acceptance](docs/acceptance.md).
 
+The dedicated HF Space adapter and UptimeRobot activation client are implemented. On November 10, the real startup rejected this CPU-only application on ZeroGPU, and switching the new Space to CPU Basic returned HTTP 402 requiring PRO. The Space is paused; monitoring and production migration have not started. See the [Space deployment guide](docs/hf_space.md). This is not a verified free hosting route for the current account.
+
 ```text
 GitHub-hosted CPU runner -> Polymarket APIs
                         -> private HF Bucket: resumable working state

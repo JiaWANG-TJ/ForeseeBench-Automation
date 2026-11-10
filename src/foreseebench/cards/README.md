@@ -70,4 +70,4 @@ extended增加Event及Market各自的完整描述、结算来源、评论树、�
 
 支付全部齐备才标native_gt.status=complete；预测时间资格另见qualification。该状态不表示已经有构造题答案或可评分。原始管线不调用LLM，V2/V4处理器及语义判分仍未配置，本数据集尚不提供模型成绩。
 
-采集和更新由[GitHub Actions](https://github.com/JiaWANG-TJ/ForeseeBench-Automation/actions)执行；HF保存和分发发布数据。工作状态使用独立私有Bucket，临时副本与工作检查点按规则清理。规范Parquet保留精确十进制字符串；精确解析JSONL时使用simplejson的use_decimal=True。来源使用条件见[Polymarket条款](https://polymarket.com/tos)。
+采集和更新由独立管线执行；实际使用本机、GitHub任务还是HF Space，以[运行验收记录](https://github.com/JiaWANG-TJ/ForeseeBench-Automation/blob/main/docs/acceptance.md)为准。Dataset保存和分发发布数据，不执行采集。云端恢复状态使用独立私有Bucket；仅完整核验的检查点可恢复，临时副本按协议清理。规范Parquet保留精确十进制字符串；精确解析JSONL时使用simplejson的use_decimal=True。来源使用条件见[Polymarket条款](https://polymarket.com/tos)。
