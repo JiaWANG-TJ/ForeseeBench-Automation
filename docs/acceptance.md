@@ -1,6 +1,22 @@
 # 云端迁移、清理与模型接口验收
 
-更新日期：2026-11-10。本机临时执行、进程恢复及HF检查点回读已经实测；GitHub托管执行仍受账户锁阻塞。独立HF Space的免费资格验证未通过，已暂停且未接管生产。本周批次在11:00 UTC截止后记录为`expired_incomplete`，未形成完整V1。
+更新日期：2026-11-11。本机服务继续执行，私有开发仓库与公开自动化仓库的GitHub Actions已按用户要求停用。独立HF Space的免费资格验证未通过，已暂停且未接管生产。本周批次在11月10日11:00 UTC截止后记录为`expired_incomplete`，未形成完整V1。
+
+## GitHub自动运行停用（2026-11-11）
+
+用户要求停止重复的Actions失败邮件，并明确保留AutoMarkov源码、注释对应自动运行配置。本次保留三个仓库、Issues、历史记录和任务定义；不修改全局邮件通知设置。
+
+| 仓库 | 仓库级Actions关闭并回读确认（UTC） | 配置处理 |
+| --- | --- | --- |
+| `JiaWANG-TJ/ForeseeBench` | 06:13:10 | 注释五分钟定时触发，保留手动入口 |
+| `JiaWANG-TJ/ForeseeBench-Automation` | 06:13:21 | 同步相同的停用配置 |
+| `JiaWANG-TJ/AutoMarkov` | 06:13:32 | 四个工作流的push、PR及定时触发注释，仅保留手动入口 |
+
+两封邮件对应的[ForeseeBench运行42942768376](https://github.com/JiaWANG-TJ/ForeseeBench/actions/runs/42942768376)和[AutoMarkov运行42640531119](https://github.com/JiaWANG-TJ/AutoMarkov/actions/runs/42640531119)均由`schedule`触发，结论为`startup_failure`，job与check-run数量均为0。接口未返回详细错误注释，不能把这两次失败直接归因为业务代码或此前的billing lock。
+
+三个仓库均先关闭服务器端Actions，再提交配置变更；06:14:55回查全部非终态运行数量为0，无需取消任务。仓库级关闭阻止旧分支继续触发，源码注释保留原定时及事件配置以便审查。当前本机采集不依赖GitHub Actions；采集协议、数据、HF资源和本机进程未修改。AutoMarkov改动在远端main的独立工作树完成，原恢复分支及未提交内容保留。
+
+操作与后续观察回执位于`data/operations/actions-disable-20261111/`，按服务器开关、远端配置、运行列表和15分钟观察分别核验。已排队投递的历史邮件无法撤回，按邮件对应运行的创建时间区分新增失败。
 
 ## 独立HF Space资格与部署代码（2026-11-10）
 

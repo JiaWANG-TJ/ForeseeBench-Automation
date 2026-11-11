@@ -1,8 +1,9 @@
 name: ForeseeBench cloud runner
 
 on:
-  schedule:
-    - cron: '*/5 * * * *'
+  # 2026-11-11按用户要求停用自动触发；仓库级Actions同时关闭。
+  # schedule:
+  #   - cron: '*/5 * * * *'
   workflow_dispatch:
     inputs:
       mode:

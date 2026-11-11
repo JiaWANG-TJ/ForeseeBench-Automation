@@ -16,11 +16,13 @@ ForeseeBench builds reproducible forecasting source data from Polymarket. It col
 
 LLM question construction, question review, constructed-question GT, and answer grading are future processors. The shared model client and its interface probe are available; a successful probe does not establish those processors or benchmark scores.
 
-## How automation runs
+## Current execution
 
-The current deployment temporarily runs on the owner's existing compute resource while GitHub runner allocation is blocked by an account billing lock. The same collection code supports both deployments; the GitHub production switch stays off during local operation. See the measured status in [acceptance](docs/acceptance.md).
+The pipeline runs on the owner's existing compute resource under Supervisor. On November 11, 2026, GitHub Actions was disabled in both the private development repository and the public automation repository, and the automatic schedule was commented out. Source code and manual workflow definitions are retained. See the measured status in [acceptance](docs/acceptance.md).
 
 The dedicated HF Space adapter and UptimeRobot activation client are implemented. On November 10, the real startup rejected this CPU-only application on ZeroGPU, and switching the new Space to CPU Basic returned HTTP 402 requiring PRO. The Space is paused; monitoring and production migration have not started. See the [Space deployment guide](docs/hf_space.md). This is not a verified free hosting route for the current account.
+
+### Retained cloud workflow (disabled)
 
 ```text
 GitHub-hosted CPU runner -> Polymarket APIs
@@ -28,7 +30,7 @@ GitHub-hosted CPU runner -> Polymarket APIs
                         -> HF Dataset: verified source and result snapshots
 ```
 
-The public automation repository uses standard GitHub-hosted Ubuntu runners. It does not require a local notebook to remain online. GitHub starts a workflow every five minutes; each run checks which batch stages are due. One production concurrency group prevents simultaneous writers.
+The retained workflow targets standard GitHub-hosted Ubuntu runners and checks which batch stages are due. Its five-minute schedule is commented out; all three workflows expose only manual dispatch, and repository Actions remains disabled. One production concurrency group prevents simultaneous writers when execution is explicitly re-enabled.
 
 Each run has 45 minutes of work, a 10-minute checkpoint allowance, and a 60-minute job limit. Long collection resumes across runs. Database transactions use local runner storage; closed, verified snapshots are uploaded explicitly to the private Bucket. Only complete generations can be restored, and the latest two working generations are retained.
 
@@ -80,12 +82,14 @@ An initial `bootstrap` starts at its real creation time, allows 18 hours for com
 
 ## Set up a deployment
 
+The following cloud setup steps apply only after an explicit decision to restore hosted execution. Repository Actions must first be re-enabled; changing the production variable alone does not restore automatic scheduling. Existing-host startup is documented above.
+
 1. Use this public source repository and a writable HF Dataset plus a private HF Bucket.
 2. Set the Dataset in `foreseebench.toml` and the Bucket/Dataset identifiers in `.github/workflows/cloud.yml`.
 3. Add the authorized `HF_TOKEN` as a GitHub Actions secret. Never commit credentials or working data.
 4. Run `Hosted runner readiness` manually and confirm `FORESEEBENCH_RUNNER_OK` in its log. A billing-lock failure before any step runs requires account resolution through [GitHub's documented process](https://docs.github.com/en/billing/how-tos/troubleshooting/locked-account); buying storage does not establish runner readiness.
 5. Run the cloud workflow manually in `qualification` mode. Re-run the same workflow execution to verify recovery from a fresh runner.
-6. After both checks pass, set the repository variable `FORESEEBENCH_ENABLED=true` to enable production. Set it to `false` to pause subsequent scheduled runs.
+6. After qualification and the single-writer handoff pass, set `FORESEEBENCH_ENABLED=true` and select `production` for an authorized manual run. Restoring the commented schedule is a separate change requiring approval.
 
 The workflow supplies `--bootstrap` when no batch exists, then follows the weekly schedule. Qualification uses an isolated Bucket prefix and never publishes production data.
 

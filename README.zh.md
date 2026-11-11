@@ -16,11 +16,13 @@ ForeseeBench从Polymarket构建可复现的预测题源数据，采集完整Even
 
 LLM构题、题目审核、构造题GT和答案判分仍是后续处理器。当前提供统一模型客户端与接口探测；接口测试成功不等于这些业务已实现或已取得评测成绩。
 
-## 自动化为什么能运行
+## 当前执行方式
 
-当前暂时运行在用户已有计算资源上，GitHub分配runner仍受账户billing lock阻塞。两种部署复用同一采集代码；本机运行期间关闭GitHub生产开关。实际状态见[验收记录](docs/acceptance.md)。
+当前由用户已有计算资源上的Supervisor运行管线。2026年11月11日，私有开发仓库和公开自动化仓库均已关闭GitHub Actions，并注释自动定时触发；源码和手动工作流定义保留。实际状态见[验收记录](docs/acceptance.md)。
 
 独立HF Space适配器和UptimeRobot激活客户端已经实现。11月10日实际启动时，ZeroGPU拒绝纯CPU应用；将新Space切换为CPU Basic又返回HTTP 402，要求PRO。新Space已暂停，监控与生产迁移均未开始。详见[Space部署说明](docs/hf_space.md)；当前账户的免费托管路径尚未通过验证。
+
+### 保留的云端工作流（已停用）
 
 ```text
 GitHub托管CPU任务 -> Polymarket API
@@ -28,7 +30,7 @@ GitHub托管CPU任务 -> Polymarket API
                  -> HF Dataset：验收通过的输入与结果快照
 ```
 
-公开运行仓库使用GitHub标准Ubuntu runner，无需本地Notebook一直在线。GitHub每五分钟触发工作流，程序检查当前哪些批次阶段到期；同一生产并发组只允许一个写入任务。
+保留的工作流面向GitHub标准Ubuntu runner，检查哪些批次阶段到期。五分钟定时触发已注释，三个工作流均只保留手动入口，仓库级Actions继续关闭。以后获明确授权恢复执行时，同一生产并发组只允许一个写入任务。
 
 每次最多处理45分钟，预留10分钟上传检查点，任务硬超时60分钟。长采集跨多次任务续跑。数据库在runner本地盘执行事务，关闭后显式上传并核验快照；恢复只接受完整代次，工作检查点保留最近两代。
 
@@ -80,12 +82,14 @@ bash scripts/service.sh stop
 
 ## 部署配置
 
+以下云端配置步骤仅适用于以后明确决定恢复托管执行的情形。须先重新启用仓库级Actions；仅修改生产变量不会恢复自动调度。当前已有主机的启动方式见上文。
+
 1. 使用公开源码仓库、有写入权限的HF Dataset和私有HF Bucket。
 2. 在`foreseebench.toml`设置Dataset，并在`.github/workflows/cloud.yml`设置Bucket及Dataset标识。
 3. 将授权的`HF_TOKEN`配置为GitHub Actions Secret，不提交凭据或工作数据。
 4. 手动运行`Hosted runner readiness`，确认日志实际出现`FORESEEBENCH_RUNNER_OK`。若执行步骤为0并报告billing lock，须按[GitHub官方流程](https://docs.github.com/en/billing/how-tos/troubleshooting/locked-account)解除账户限制；购买存储不能证明runner已经可用。
 5. 手动运行云端工作流的`qualification`模式，再重跑同一次执行，验证从新的runner恢复检查点。
-6. 两项检查通过后，将仓库变量`FORESEEBENCH_ENABLED`设为`true`启用生产；设为`false`暂停后续定时运行。
+6. 资格验证与单一写入者移交通过后，将`FORESEEBENCH_ENABLED`设为`true`，在获授权的手动运行中选择`production`。恢复已注释的定时触发须另行明确批准。
 
 首次没有批次时，工作流以`--bootstrap`启动，随后遵循每周日程。工程核验使用独立Bucket前缀，不发布正式数据。
 
